@@ -119,6 +119,14 @@ fn main() -> Result<()> {
         .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
         .collect();
 
+    let pkg_has_lib: HashSet<String> = metadata
+        .packages
+        .iter()
+        .filter(|p| workspace_members.contains(&p.id))
+        .filter(|p| p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()))
+        .map(|p| p.name.to_string())
+        .collect();
+
     let mut pending_nodes: Vec<&Node> = resolve
         .nodes
         .iter()
@@ -149,6 +157,7 @@ fn main() -> Result<()> {
                     node,
                     &pkg_names,
                     &pkg_manifest_paths,
+                    &pkg_has_lib,
                     &current_y,
                     &mut failed,
                     cli.verbose,
@@ -699,6 +708,7 @@ fn evaluate_crate_bump(
     node: &Node,
     pkg_names: &HashMap<&PackageId, String>,
     pkg_manifest_paths: &HashMap<String, String>,
+    pkg_has_lib: &HashSet<String>,
     current_y: &HashSet<String>,
     failed: &mut HashSet<String>,
     verbose: bool,
@@ -715,6 +725,22 @@ fn evaluate_crate_bump(
 
     if bumped_deps.is_empty() {
         return Ok((Bump::None, vec![]));
+    }
+
+    if !pkg_has_lib.contains(&node_name) {
+        println!(
+            "  {} {} is binary-only, no public API to leak",
+            "->".dimmed(),
+            node_name.cyan()
+        );
+        let influences = bumped_deps
+            .into_iter()
+            .map(|dep_name| DepInfluence {
+                dep_name,
+                bump: Bump::Patch,
+            })
+            .collect();
+        return Ok((Bump::Patch, influences));
     }
 
     println!(
