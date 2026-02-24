@@ -1,7 +1,7 @@
 #![allow(clippy::format_in_format_args)]
 
 use anyhow::{Context, Result};
-use cargo_metadata::{MetadataCommand, Node, PackageId};
+use cargo_metadata::{DependencyKind, MetadataCommand, Node, NodeDep, PackageId};
 use clap::Parser;
 use colored::Colorize;
 use regex::Regex;
@@ -112,6 +112,13 @@ fn main() -> Result<()> {
         .map(|p| (&p.id, p.name.to_string().clone()))
         .collect();
 
+    let pkg_manifest_paths: HashMap<String, String> = metadata
+        .packages
+        .iter()
+        .filter(|p| workspace_members.contains(&p.id))
+        .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
+        .collect();
+
     let mut pending_nodes: Vec<&Node> = resolve
         .nodes
         .iter()
@@ -127,7 +134,7 @@ fn main() -> Result<()> {
             let node = pending_nodes[i];
             let node_name = pkg_names[&node.id].clone();
 
-            let deps_ready = node.deps.iter().all(|dep| {
+            let deps_ready = node.deps.iter().filter(|d| is_normal_dep(d)).all(|dep| {
                 if dep.pkg == node.id {
                     true
                 } else if workspace_members.contains(&dep.pkg) {
@@ -138,8 +145,14 @@ fn main() -> Result<()> {
             });
 
             if deps_ready {
-                let (bump, influences) =
-                    evaluate_crate_bump(node, &pkg_names, &current_y, &mut failed, cli.verbose)?;
+                let (bump, influences) = evaluate_crate_bump(
+                    node,
+                    &pkg_names,
+                    &pkg_manifest_paths,
+                    &current_y,
+                    &mut failed,
+                    cli.verbose,
+                )?;
 
                 for inf in &influences {
                     tree_edges
@@ -172,7 +185,7 @@ fn main() -> Result<()> {
             let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
             for node in &pending_nodes {
                 let name = pkg_names[&node.id].as_str();
-                for dep in &node.deps {
+                for dep in node.deps.iter().filter(|d| is_normal_dep(d)) {
                     if dep.pkg == node.id {
                         continue;
                     }
@@ -670,6 +683,14 @@ fn dfs_cycle<'a>(
     None
 }
 
+/// Returns true if this dependency edge includes a Normal (non-dev, non-build)
+/// dependency kind. Only normal deps affect the public API and semver surface.
+fn is_normal_dep(dep: &NodeDep) -> bool {
+    dep.dep_kinds
+        .iter()
+        .any(|dk| dk.kind == DependencyKind::Normal)
+}
+
 // ---------------------------------------------------------------------------
 // Evaluate public API exposure
 // ---------------------------------------------------------------------------
@@ -677,6 +698,7 @@ fn dfs_cycle<'a>(
 fn evaluate_crate_bump(
     node: &Node,
     pkg_names: &HashMap<&PackageId, String>,
+    pkg_manifest_paths: &HashMap<String, String>,
     current_y: &HashSet<String>,
     failed: &mut HashSet<String>,
     verbose: bool,
@@ -686,7 +708,7 @@ fn evaluate_crate_bump(
     let bumped_deps: Vec<String> = node
         .deps
         .iter()
-        .filter(|d| d.pkg != node.id)
+        .filter(|d| d.pkg != node.id && is_normal_dep(d))
         .map(|d| pkg_names[&d.pkg].clone())
         .filter(|name| current_y.contains(name))
         .collect();
@@ -701,8 +723,18 @@ fn evaluate_crate_bump(
         format!("{:?}", bumped_deps).dimmed()
     );
 
+    let manifest = pkg_manifest_paths
+        .get(&node_name)
+        .with_context(|| format!("No manifest path for {}", node_name))?;
+
     let output = Command::new("cargo")
-        .args(["+nightly", "public-api", "-p", &node_name, "--simplified"])
+        .args([
+            "+nightly",
+            "public-api",
+            "--manifest-path",
+            manifest,
+            "--simplified",
+        ])
         .output()
         .with_context(|| format!("Failed to run cargo public-api on {}", node_name))?;
 
