@@ -1,0 +1,14 @@
+[package]
+name = "semwave"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+cargo_metadata = "0.23.1"
+clap = { version = "4.5.60", features = ["derive"] }
+colored = "3"
+public-api = "0.50.3"
+regex = "1.12.3"
+semver = "1"
+toml = "0.8"
