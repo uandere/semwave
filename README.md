@@ -28,9 +28,9 @@ warnings when it had to guess conservatively.
 
 ```mermaid
 flowchart LR
-  Change["Seed change"] --> Leaked{Leaked in\npublic API?}
+  Change["Seed change"] --> Leaked{Leaked in<br>public API?}
   
-  Leaked -->|Yes| LeakedBump["Bump depends on\nchange type + version scheme"]
+  Leaked -->|Yes| LeakedBump["Bump depends on<br>change type + version scheme"]
   Leaked -->|No| Patch["PATCH bump"]
 
   LeakedBump --> T1["Breaking + >=1.0.0 → MAJOR"]
