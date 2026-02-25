@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long, default_value = "HEAD")]
     target: String,
 
-    /// Comma-separated crate names to treat as MINOR-bumped seeds directly,
+    /// Comma-separated crate names to treat as breaking-change seeds directly,
     /// skipping git-based version detection
     #[arg(long, value_delimiter = ',')]
     direct: Option<Vec<String>>,
@@ -39,11 +39,21 @@ struct Cli {
     tree: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Bump {
-    Minor,
-    Patch,
     None,
+    Patch,
+    Minor,
+    Major,
+}
+
+/// Semantic classification of a version change, independent of the version scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ChangeKind {
+    None,
+    Patch,
+    Additive,
+    Breaking,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
@@ -53,6 +63,63 @@ struct DepInfluence {
     bump: Bump,
 }
 
+/// Return type for `detect_version_changes`: (breaking_seeds, additive_seeds, local_bumps).
+type VersionChanges = (HashSet<String>, HashSet<String>, HashMap<String, Bump>);
+
+/// Shared read-only context passed to `evaluate_crate_bump` to avoid too many arguments.
+struct WorkspaceContext {
+    pkg_names: HashMap<PackageId, String>,
+    pkg_manifest_paths: HashMap<String, String>,
+    pkg_has_lib: HashSet<String>,
+    pkg_versions: HashMap<String, Version>,
+}
+
+/// Classify the semantic change between two versions.
+/// For `0.y.z`: minor change = Breaking, patch change = Patch.
+/// For `>=1.0.0`: major change = Breaking, minor change = Additive, patch change = Patch.
+fn classify_version_change(old: &Version, new: &Version) -> ChangeKind {
+    if old.major == 0 && new.major == 0 {
+        if old.minor != new.minor {
+            ChangeKind::Breaking
+        } else if old.patch != new.patch {
+            ChangeKind::Patch
+        } else {
+            ChangeKind::None
+        }
+    } else if old.major != new.major {
+        ChangeKind::Breaking
+    } else if old.minor != new.minor {
+        ChangeKind::Additive
+    } else if old.patch != new.patch {
+        ChangeKind::Patch
+    } else {
+        ChangeKind::None
+    }
+}
+
+/// Map a semantic change kind to the concrete version bump needed,
+/// based on the consumer crate's current version scheme.
+fn required_bump(version: &Version, change: ChangeKind) -> Bump {
+    match change {
+        ChangeKind::Breaking => {
+            if version.major == 0 {
+                Bump::Minor
+            } else {
+                Bump::Major
+            }
+        }
+        ChangeKind::Additive => {
+            if version.major == 0 {
+                Bump::Patch
+            } else {
+                Bump::Minor
+            }
+        }
+        ChangeKind::Patch => Bump::Patch,
+        ChangeKind::None => Bump::None,
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -60,42 +127,58 @@ fn main() -> Result<()> {
         colored::control::set_override(false);
     }
 
-    let (seeds, local_bumps) = if let Some(direct_crates) = cli.direct {
+    let (breaking_seeds, additive_seeds, local_bumps) = if let Some(direct_crates) = cli.direct {
         let seeds: HashSet<String> = direct_crates.into_iter().collect();
         println!(
-            "{} assuming MINOR bump for {}\n",
+            "{} assuming BREAKING change for {}\n",
             "Direct mode:".bold(),
             format!("{:?}", seeds).cyan()
         );
-        (seeds, HashMap::new())
+        (seeds, HashSet::new(), HashMap::new())
     } else {
         println!(
             "Comparing versions between {} and {}...\n",
             cli.source.cyan().bold(),
             cli.target.cyan().bold()
         );
-        let (seeds, local_bumps) = detect_version_changes(&cli.source, &cli.target)?;
+        let (breaking_seeds, additive_seeds, local_bumps) =
+            detect_version_changes(&cli.source, &cli.target)?;
 
-        if seeds.is_empty() {
+        if breaking_seeds.is_empty() && additive_seeds.is_empty() {
             println!(
                 "{}",
-                "No minor/major version bumps detected. Nothing to propagate.".green()
+                "No breaking/additive version changes detected. Nothing to propagate.".green()
             );
             return Ok(());
         }
 
-        println!(
-            "\n{} {}\n",
-            "Seed dependencies (MINOR/MAJOR-bumped):".bold(),
-            format!("{:?}", seeds).cyan()
-        );
-        (seeds, local_bumps)
+        if !breaking_seeds.is_empty() {
+            println!(
+                "\n{} {}\n",
+                "Breaking seeds:".bold(),
+                format!("{:?}", breaking_seeds).red()
+            );
+        }
+        if !additive_seeds.is_empty() {
+            println!(
+                "{} {}\n",
+                "Additive seeds:".bold(),
+                format!("{:?}", additive_seeds).yellow()
+            );
+        }
+        (breaking_seeds, additive_seeds, local_bumps)
     };
 
-    let mut current_y = seeds.clone();
-    let mut current_x: HashSet<String> = HashSet::new();
+    let all_seeds: HashSet<String> = breaking_seeds
+        .iter()
+        .chain(additive_seeds.iter())
+        .cloned()
+        .collect();
+
+    let mut breaking_crates = breaking_seeds.clone();
+    let mut additive_crates = additive_seeds.clone();
+    let mut patch_crates: HashSet<String> = HashSet::new();
     let mut failed: HashSet<String> = HashSet::new();
-    // influencer -> Vec<(influenced_crate, edge_bump)>
     let mut tree_edges: HashMap<String, Vec<(String, Bump)>> = HashMap::new();
 
     let metadata = MetadataCommand::new()
@@ -106,26 +189,32 @@ fn main() -> Result<()> {
 
     let workspace_members: HashSet<&PackageId> = metadata.workspace_members.iter().collect();
 
-    let pkg_names: HashMap<&PackageId, String> = metadata
-        .packages
-        .iter()
-        .map(|p| (&p.id, p.name.to_string().clone()))
-        .collect();
-
-    let pkg_manifest_paths: HashMap<String, String> = metadata
-        .packages
-        .iter()
-        .filter(|p| workspace_members.contains(&p.id))
-        .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
-        .collect();
-
-    let pkg_has_lib: HashSet<String> = metadata
-        .packages
-        .iter()
-        .filter(|p| workspace_members.contains(&p.id))
-        .filter(|p| p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()))
-        .map(|p| p.name.to_string())
-        .collect();
+    let ctx = WorkspaceContext {
+        pkg_names: metadata
+            .packages
+            .iter()
+            .map(|p| (p.id.clone(), p.name.to_string()))
+            .collect(),
+        pkg_manifest_paths: metadata
+            .packages
+            .iter()
+            .filter(|p| workspace_members.contains(&p.id))
+            .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
+            .collect(),
+        pkg_has_lib: metadata
+            .packages
+            .iter()
+            .filter(|p| workspace_members.contains(&p.id))
+            .filter(|p| p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()))
+            .map(|p| p.name.to_string())
+            .collect(),
+        pkg_versions: metadata
+            .packages
+            .iter()
+            .filter(|p| workspace_members.contains(&p.id))
+            .map(|p| (p.name.to_string(), p.version.clone()))
+            .collect(),
+    };
 
     let mut pending_nodes: Vec<&Node> = resolve
         .nodes
@@ -140,25 +229,24 @@ fn main() -> Result<()> {
 
         for i in (0..pending_nodes.len()).rev() {
             let node = pending_nodes[i];
-            let node_name = pkg_names[&node.id].clone();
+            let node_name = ctx.pkg_names[&node.id].clone();
 
             let deps_ready = node.deps.iter().filter(|d| is_normal_dep(d)).all(|dep| {
                 if dep.pkg == node.id {
                     true
                 } else if workspace_members.contains(&dep.pkg) {
-                    processed.contains(&pkg_names[&dep.pkg])
+                    processed.contains(&ctx.pkg_names[&dep.pkg])
                 } else {
                     true
                 }
             });
 
             if deps_ready {
-                let (bump, influences) = evaluate_crate_bump(
+                let (change_kind, _bump, influences) = evaluate_crate_bump(
                     node,
-                    &pkg_names,
-                    &pkg_manifest_paths,
-                    &pkg_has_lib,
-                    &current_y,
+                    &ctx,
+                    &breaking_crates,
+                    &additive_crates,
                     &mut failed,
                     cli.verbose,
                 )?;
@@ -167,17 +255,20 @@ fn main() -> Result<()> {
                     tree_edges
                         .entry(inf.dep_name.clone())
                         .or_default()
-                        .push((node_name.clone(), inf.bump.clone()));
+                        .push((node_name.clone(), inf.bump));
                 }
 
-                match bump {
-                    Bump::Minor => {
-                        current_y.insert(node_name.clone());
+                match change_kind {
+                    ChangeKind::Breaking => {
+                        breaking_crates.insert(node_name.clone());
                     }
-                    Bump::Patch => {
-                        current_x.insert(node_name.clone());
+                    ChangeKind::Additive => {
+                        additive_crates.insert(node_name.clone());
                     }
-                    Bump::None => {}
+                    ChangeKind::Patch => {
+                        patch_crates.insert(node_name.clone());
+                    }
+                    ChangeKind::None => {}
                 }
 
                 processed.insert(node_name);
@@ -189,16 +280,16 @@ fn main() -> Result<()> {
         if !made_progress {
             let stuck: Vec<String> = pending_nodes
                 .iter()
-                .map(|n| pkg_names[&n.id].clone())
+                .map(|n| ctx.pkg_names[&n.id].clone())
                 .collect();
             let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
             for node in &pending_nodes {
-                let name = pkg_names[&node.id].as_str();
+                let name = ctx.pkg_names[&node.id].as_str();
                 for dep in node.deps.iter().filter(|d| is_normal_dep(d)) {
                     if dep.pkg == node.id {
                         continue;
                     }
-                    let dep_name = pkg_names[&dep.pkg].as_str();
+                    let dep_name = ctx.pkg_names[&dep.pkg].as_str();
                     if stuck.iter().any(|s| s == dep_name) {
                         adj.entry(name).or_default().push(dep_name);
                     }
@@ -225,61 +316,135 @@ fn main() -> Result<()> {
         }
     }
 
-    for seed in &seeds {
-        current_y.remove(seed);
-        current_x.remove(seed);
+    // Remove seeds and already-bumped crates from the result sets
+    for seed in &all_seeds {
+        breaking_crates.remove(seed);
+        additive_crates.remove(seed);
+        patch_crates.remove(seed);
     }
 
     for (name, existing_bump) in &local_bumps {
-        match existing_bump {
+        match *existing_bump {
+            Bump::Major => {
+                breaking_crates.remove(name);
+                additive_crates.remove(name);
+                patch_crates.remove(name);
+            }
             Bump::Minor => {
-                current_y.remove(name);
-                current_x.remove(name);
+                additive_crates.remove(name);
+                patch_crates.remove(name);
             }
             Bump::Patch => {
-                current_x.remove(name);
+                patch_crates.remove(name);
             }
             Bump::None => {}
         }
     }
 
+    // Map each set to final bump based on crate version
+    let mut major_list: HashSet<String> = HashSet::new();
+    let mut minor_list: HashSet<String> = HashSet::new();
+    let mut patch_list: HashSet<String> = patch_crates;
+
+    for name in &breaking_crates {
+        let bump = ctx
+            .pkg_versions
+            .get(name)
+            .map(|v| required_bump(v, ChangeKind::Breaking))
+            .unwrap_or(Bump::Minor);
+        match bump {
+            Bump::Major => {
+                major_list.insert(name.clone());
+            }
+            _ => {
+                minor_list.insert(name.clone());
+            }
+        }
+    }
+
+    for name in &additive_crates {
+        let bump = ctx
+            .pkg_versions
+            .get(name)
+            .map(|v| required_bump(v, ChangeKind::Additive))
+            .unwrap_or(Bump::Patch);
+        match bump {
+            Bump::Minor => {
+                minor_list.insert(name.clone());
+            }
+            _ => {
+                patch_list.insert(name.clone());
+            }
+        }
+    }
+
     if cli.tree {
         println!("\n{}", "=== Influence Tree ===".bold().green());
-        print_influence_tree(&seeds, &tree_edges);
+        print_influence_tree(&all_seeds, &tree_edges);
         println!();
     }
 
     println!("{}", "=== Analysis Complete ===".bold().green());
     println!(
         "{} {:?}",
-        "List Y (Requires MINOR bump / 0.↑.0):".yellow().bold(),
-        current_y
+        "MAJOR-bump list (Requires MAJOR bump / ↑.0.0):"
+            .red()
+            .bold(),
+        major_list
     );
     println!(
         "{} {:?}",
-        "List X (Requires PATCH bump / 0.y.↑):".cyan().bold(),
-        current_x
+        "MINOR-bump list (Requires MINOR bump / x.↑.0):"
+            .yellow()
+            .bold(),
+        minor_list
+    );
+    println!(
+        "{} {:?}",
+        "PATCH-bump list (Requires PATCH bump / x.y.↑):"
+            .cyan()
+            .bold(),
+        patch_list
     );
 
     if !failed.is_empty() {
         eprintln!(
             "\n{} The following crates failed to build with `cargo public-api` \
-             and were conservatively placed in list Y (MINOR). Verify manually:\n  {:?}",
+             and were conservatively assumed breaking. Verify manually:\n  {:?}",
             "WARNING:".yellow().bold(),
             failed
         );
     }
 
-    let under_bumped: Vec<&String> = current_y
+    let all_required: HashMap<&String, Bump> = major_list
         .iter()
-        .filter(|name| local_bumps.get(*name) == Some(&Bump::Patch))
+        .map(|n| (n, Bump::Major))
+        .chain(minor_list.iter().map(|n| (n, Bump::Minor)))
+        .chain(patch_list.iter().map(|n| (n, Bump::Patch)))
+        .collect();
+
+    let under_bumped: Vec<(&String, Bump, &Bump)> = all_required
+        .iter()
+        .filter_map(|(name, required)| {
+            local_bumps
+                .get(*name)
+                .filter(|local| local < &required)
+                .map(|local| (*name, *required, local))
+        })
         .collect();
     if !under_bumped.is_empty() {
         eprintln!(
-            "\n{} These crates received PATCH bumps but require MINOR bumps:\n  {:?}",
-            "ERROR:".red().bold(),
-            under_bumped
+            "\n{} These crates have insufficient version bumps:",
+            "ERROR:".red().bold()
         );
+        for (name, required, local) in &under_bumped {
+            eprintln!(
+                "  {} has {:?} bump but requires {:?}",
+                name.cyan(),
+                local,
+                required
+            );
+        }
     }
 
     Ok(())
@@ -332,6 +497,10 @@ fn print_tree_children(
         let child_prefix = if is_last { "    " } else { "│   " };
 
         let (colored_connector, bump_label) = match bump {
+            Bump::Major => (
+                connector.red().bold().to_string(),
+                "MAJOR".red().bold().to_string(),
+            ),
             Bump::Minor => (
                 connector.red().bold().to_string(),
                 "MINOR".red().bold().to_string(),
@@ -369,13 +538,11 @@ fn print_tree_children(
 // Step 1: Detect dependency version changes between two git refs
 // ---------------------------------------------------------------------------
 
-fn detect_version_changes(
-    source: &str,
-    target: &str,
-) -> Result<(HashSet<String>, HashMap<String, Bump>)> {
+fn detect_version_changes(source: &str, target: &str) -> Result<VersionChanges> {
     let changed_files = get_changed_cargo_tomls(source, target)?;
 
-    let mut seeds: HashSet<String> = HashSet::new();
+    let mut breaking_seeds: HashSet<String> = HashSet::new();
+    let mut additive_seeds: HashSet<String> = HashSet::new();
     let mut local_bumps: HashMap<String, Bump> = HashMap::new();
 
     println!("{}", "Detected version changes:".bold());
@@ -405,15 +572,33 @@ fn detect_version_changes(
             ) else {
                 continue;
             };
-            if (nv.major != ov.major || nv.minor != ov.minor) && seeds.insert(name.clone()) {
-                println!(
-                    "  {} {}: {} -> {} {}",
-                    "[dep]".dimmed(),
-                    name.cyan(),
-                    old_ver_str.dimmed(),
-                    new_ver_str.white().bold(),
-                    "(MINOR+)".yellow().bold()
-                );
+            let change = classify_version_change(&ov, &nv);
+            match change {
+                ChangeKind::Breaking => {
+                    if breaking_seeds.insert(name.clone()) {
+                        println!(
+                            "  {} {}: {} -> {} {}",
+                            "[dep]".dimmed(),
+                            name.cyan(),
+                            old_ver_str.dimmed(),
+                            new_ver_str.white().bold(),
+                            "(BREAKING)".red().bold()
+                        );
+                    }
+                }
+                ChangeKind::Additive => {
+                    if !breaking_seeds.contains(name) && additive_seeds.insert(name.clone()) {
+                        println!(
+                            "  {} {}: {} -> {} {}",
+                            "[dep]".dimmed(),
+                            name.cyan(),
+                            old_ver_str.dimmed(),
+                            new_ver_str.white().bold(),
+                            "(ADDITIVE)".yellow().bold()
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -424,32 +609,50 @@ fn detect_version_changes(
             if local_bumps.contains_key(&name) {
                 continue;
             }
-            if nv.major != ov.major || nv.minor != ov.minor {
-                println!(
-                    "  {} {}: {} -> {} {}",
-                    "[local]".dimmed(),
-                    name.cyan(),
-                    ov.to_string().dimmed(),
-                    nv.to_string().white().bold(),
-                    "(MINOR+)".yellow().bold()
-                );
-                seeds.insert(name.clone());
-                local_bumps.insert(name, Bump::Minor);
-            } else if nv.patch != ov.patch {
-                println!(
-                    "  {} {}: {} -> {} {}",
-                    "[local]".dimmed(),
-                    name.cyan(),
-                    ov.to_string().dimmed(),
-                    nv.to_string().white().bold(),
-                    "(PATCH)".green()
-                );
-                local_bumps.insert(name, Bump::Patch);
+            let change = classify_version_change(&ov, &nv);
+            let bump = required_bump(&ov, change);
+            match change {
+                ChangeKind::Breaking => {
+                    println!(
+                        "  {} {}: {} -> {} {}",
+                        "[local]".dimmed(),
+                        name.cyan(),
+                        ov.to_string().dimmed(),
+                        nv.to_string().white().bold(),
+                        "(BREAKING)".red().bold()
+                    );
+                    breaking_seeds.insert(name.clone());
+                    local_bumps.insert(name, bump);
+                }
+                ChangeKind::Additive => {
+                    println!(
+                        "  {} {}: {} -> {} {}",
+                        "[local]".dimmed(),
+                        name.cyan(),
+                        ov.to_string().dimmed(),
+                        nv.to_string().white().bold(),
+                        "(ADDITIVE)".yellow().bold()
+                    );
+                    additive_seeds.insert(name.clone());
+                    local_bumps.insert(name, bump);
+                }
+                ChangeKind::Patch => {
+                    println!(
+                        "  {} {}: {} -> {} {}",
+                        "[local]".dimmed(),
+                        name.cyan(),
+                        ov.to_string().dimmed(),
+                        nv.to_string().white().bold(),
+                        "(PATCH)".green()
+                    );
+                    local_bumps.insert(name, Bump::Patch);
+                }
+                ChangeKind::None => {}
             }
         }
     }
 
-    Ok((seeds, local_bumps))
+    Ok((breaking_seeds, additive_seeds, local_bumps))
 }
 
 fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>> {
@@ -706,50 +909,64 @@ fn is_normal_dep(dep: &NodeDep) -> bool {
 
 fn evaluate_crate_bump(
     node: &Node,
-    pkg_names: &HashMap<&PackageId, String>,
-    pkg_manifest_paths: &HashMap<String, String>,
-    pkg_has_lib: &HashSet<String>,
-    current_y: &HashSet<String>,
+    ctx: &WorkspaceContext,
+    breaking_crates: &HashSet<String>,
+    additive_crates: &HashSet<String>,
     failed: &mut HashSet<String>,
     verbose: bool,
-) -> Result<(Bump, Vec<DepInfluence>)> {
-    let node_name = pkg_names[&node.id].clone();
+) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
+    let node_name = ctx.pkg_names[&node.id].clone();
+    let node_version = ctx.pkg_versions.get(&node_name);
 
-    let bumped_deps: Vec<String> = node
+    let affected_deps: Vec<(String, ChangeKind)> = node
         .deps
         .iter()
         .filter(|d| d.pkg != node.id && is_normal_dep(d))
-        .map(|d| pkg_names[&d.pkg].clone())
-        .filter(|name| current_y.contains(name))
+        .map(|d| ctx.pkg_names[&d.pkg].clone())
+        .filter_map(|name| {
+            if breaking_crates.contains(&name) {
+                Some((name, ChangeKind::Breaking))
+            } else if additive_crates.contains(&name) {
+                Some((name, ChangeKind::Additive))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    if bumped_deps.is_empty() {
-        return Ok((Bump::None, vec![]));
+    if affected_deps.is_empty() {
+        return Ok((ChangeKind::None, Bump::None, vec![]));
     }
 
-    if !pkg_has_lib.contains(&node_name) {
+    let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| n.as_str()).collect();
+
+    if !ctx.pkg_has_lib.contains(&node_name) {
         println!(
             "  {} {} is binary-only, no public API to leak",
             "->".dimmed(),
             node_name.cyan()
         );
-        let influences = bumped_deps
+        let bump = node_version
+            .map(|v| required_bump(v, ChangeKind::Patch))
+            .unwrap_or(Bump::Patch);
+        let influences = affected_deps
             .into_iter()
-            .map(|dep_name| DepInfluence {
+            .map(|(dep_name, _)| DepInfluence {
                 dep_name,
                 bump: Bump::Patch,
             })
             .collect();
-        return Ok((Bump::Patch, influences));
+        return Ok((ChangeKind::Patch, bump, influences));
     }
 
     println!(
         "Analyzing {} for public API exposure of {}",
         node_name.cyan().bold(),
-        format!("{:?}", bumped_deps).dimmed()
+        format!("{:?}", dep_names).dimmed()
     );
 
-    let manifest = pkg_manifest_paths
+    let manifest = ctx
+        .pkg_manifest_paths
         .get(&node_name)
         .with_context(|| format!("No manifest path for {}", node_name))?;
 
@@ -771,30 +988,39 @@ fn evaluate_crate_bump(
             .rev()
             .find(|l| !l.is_empty())
             .unwrap_or("(no stderr)");
+        let worst_change = affected_deps
+            .iter()
+            .map(|(_, ck)| *ck)
+            .max()
+            .unwrap_or(ChangeKind::Breaking);
+        let conservative_bump = node_version
+            .map(|v| required_bump(v, worst_change))
+            .unwrap_or(Bump::Minor);
         eprintln!(
             "  {} cargo public-api failed for {}: {}\n  \
-             Conservatively assuming MINOR bump.",
+             Conservatively assuming {:?} bump.",
             "WARNING:".yellow().bold(),
             node_name.cyan(),
-            last_meaningful_line
+            last_meaningful_line,
+            conservative_bump
         );
         failed.insert(node_name);
-        let influences = bumped_deps
+        let influences = affected_deps
             .into_iter()
-            .map(|dep_name| DepInfluence {
+            .map(|(dep_name, _)| DepInfluence {
                 dep_name,
-                bump: Bump::Minor,
+                bump: conservative_bump,
             })
             .collect();
-        return Ok((Bump::Minor, influences));
+        return Ok((worst_change, conservative_bump, influences));
     }
 
     let api_text = String::from_utf8_lossy(&output.stdout);
 
-    let mut final_bump = Bump::Patch;
+    let mut worst_change = ChangeKind::Patch;
     let mut influences = Vec::new();
 
-    for dep_name in bumped_deps {
+    for (dep_name, dep_change) in affected_deps {
         let mod_name = dep_name.replace('-', "_");
 
         let pattern = format!(r"\b{}::", regex::escape(&mod_name));
@@ -803,11 +1029,16 @@ fn evaluate_crate_bump(
         let matching_lines: Vec<&str> = api_text.lines().filter(|line| re.is_match(line)).collect();
 
         if !matching_lines.is_empty() {
+            let edge_change = dep_change;
+            let edge_bump = node_version
+                .map(|v| required_bump(v, edge_change))
+                .unwrap_or(Bump::Minor);
             println!(
-                "  {} {} leaks {}:",
+                "  {} {} leaks {} ({:?}):",
                 "->".red().bold(),
                 node_name.red().bold(),
-                dep_name.yellow()
+                dep_name.yellow(),
+                edge_bump
             );
             if verbose {
                 for line in &matching_lines {
@@ -816,9 +1047,9 @@ fn evaluate_crate_bump(
             }
             influences.push(DepInfluence {
                 dep_name,
-                bump: Bump::Minor,
+                bump: edge_bump,
             });
-            final_bump = Bump::Minor;
+            worst_change = worst_change.max(edge_change);
         } else {
             influences.push(DepInfluence {
                 dep_name,
@@ -827,5 +1058,9 @@ fn evaluate_crate_bump(
         }
     }
 
-    Ok((final_bump, influences))
+    let final_bump = node_version
+        .map(|v| required_bump(v, worst_change))
+        .unwrap_or(Bump::Patch);
+
+    Ok((worst_change, final_bump, influences))
 }
