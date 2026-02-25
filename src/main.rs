@@ -1046,7 +1046,7 @@ fn evaluate_crate_bump(
     for (dep_name, dep_change) in affected_deps {
         let mod_name = dep_name.replace('-', "_");
 
-        let pattern = format!(r"\b{}::", regex::escape(&mod_name));
+        let pattern = format!(r"(?:^|[^a-zA-Z0-9_:]){}::", regex::escape(&mod_name));
         let re = Regex::new(&pattern)?;
 
         let matching_lines: Vec<&str> = api_text.lines().filter(|line| re.is_match(line)).collect();

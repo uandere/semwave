@@ -51,7 +51,7 @@ flowchart LR
 ## The bad
 
 - **Requires a nightly toolchain** — `cargo public-api` depends on rustdoc JSON output, which is a nightly-only feature. This can be a friction point in CI environments locked to stable.
-- **Regex-based leak detection** — public API exposure is checked by searching for `dep_name::` patterns in the `cargo public-api` output. Re-exports under a different path, blanket trait impls, or type aliases that hide the original crate path can be missed (false negatives) or, less likely, over-matched (false positives).
+- **Regex-based leak detection** — public API exposure is checked by searching for `dep_name::` patterns in the `cargo public-api` output. Re-exports erase the original crate path (`pub use child::Child;` appears as `father::Child` in the output), so the regex misses them even though the crate genuinely leaks the dependency's type (false negative).
 - **Type-level only** — `semwave` detects leaked *types*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
 - **Complex version requirements are unsupported** — ranges (`>=1.2, <2`), wildcards (`1.*`), and multi-constraint specs are skipped during seed detection.
 - **Cargo workspaces only** — the tool is purpose-built for Rust/Cargo. It won't help with polyglot monorepos or non-Cargo Rust projects.
