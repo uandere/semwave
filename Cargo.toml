@@ -2,6 +2,12 @@
 name = "semwave"
 version = "0.1.0"
 edition = "2024"
+description = "Static analysis tool for semver bump propagation in Cargo workspaces"
+license = "MIT"
+repository = "https://github.com/uandere/semwave"
+readme = "README.md"
+keywords = ["semver", "versioning", "cargo", "workspace", "static-analysis", "bump"]
+categories = ["development-tools::cargo-plugins"]
 
 [dependencies]
 anyhow = "1.0.102"

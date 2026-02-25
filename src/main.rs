@@ -1,3 +1,26 @@
+//! # 🌊 semwave
+//!
+//! A static analysis tool that answers the question:
+//!
+//! > *"If I bump crates A, B and C in this Rust project — what else do I need to bump and how?"*
+//!
+//! ## How it works
+//!
+//! 1. Accepts the list of breaking version bumps (the "seeds"). By default this means
+//!    diffing `Cargo.toml` files between two git refs to find dependency versions that
+//!    changed in breaking or additive ways. Alternatively, use `--direct` to specify
+//!    seeds explicitly.
+//!
+//! 2. Walks the workspace dependency graph starting from the seeds. For each dependent,
+//!    it checks whether the crate leaks any seed types in its public API. If it does,
+//!    that crate itself needs a bump — and becomes a new seed, triggering the same check
+//!    on *its* dependents, and so on until the wave settles. The bump level
+//!    (major/minor/patch) depends on the change type and the consumer's version scheme
+//!    (`0.y.z` vs `>=1.0.0`).
+//!
+//! The output is three lists: **MAJOR** bumps, **MINOR** bumps, and **PATCH** bumps,
+//! plus optional warnings when the tool had to guess conservatively.
+
 #![allow(clippy::format_in_format_args)]
 
 use anyhow::{Context, Result};
@@ -675,8 +698,8 @@ fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>> {
 }
 
 /// Extract all dependency name -> version mappings from a parsed Cargo.toml.
-/// Covers [workspace.dependencies], [dependencies], [dev-dependencies],
-/// and [build-dependencies]. Entries using `workspace = true` (no explicit
+/// Covers \[workspace.dependencies\], \[dependencies\], \[dev-dependencies\],
+/// and \[build-dependencies\]. Entries using `workspace = true` (no explicit
 /// version) are skipped -- their versions come from the workspace root.
 fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
     let mut versions = HashMap::new();
@@ -795,8 +818,8 @@ fn extract_package_version(
     Ok((name, version))
 }
 
-/// Walk parent directories to find the nearest [workspace] manifest and
-/// return its [workspace.package].version.
+/// Walk parent directories to find the nearest \[workspace\] manifest and
+/// return its \[workspace.package\].version.
 fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Version> {
     let mut dir = Path::new(crate_toml_path)
         .parent()
