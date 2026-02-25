@@ -41,11 +41,21 @@ flowchart LR
 
 ## The good
 
-TODO
+- **Static analysis only** — no need to compile every dependent crate or run their test suites. The tool piggybacks on `cargo public-api` output and regex-based leak detection, so results arrive in seconds, not hours.
+- **Transitive propagation** — a bump in crate A that leaks into crate B automatically makes B a new seed. The wave keeps going until no new leaks are found, catching cascading effects that humans routinely miss.
+- **Semver-scheme-aware** — correctly distinguishes `0.y.z` (where a minor bump is breaking) from `>=1.0.0` (where a minor bump is additive). Bump recommendations respect whichever scheme the consumer crate uses.
+- **Under-bump detection** — if a crate already has a version bump in the diff but that bump is *insufficient* (e.g., PATCH when MINOR is required), `semwave` flags it explicitly.
+- **Two input modes** — git-diff mode automatically discovers seeds from `Cargo.toml` changes between two refs; direct mode lets you ask hypothetical "what if?" questions without touching git.
+- **Influence tree** — the `--tree` flag prints a human-readable tree showing exactly how and why each bump propagates, making it easy to explain the reasoning to reviewers.
 
 ## The bad
 
-TODO
+- **Requires a nightly toolchain** — `cargo public-api` depends on rustdoc JSON output, which is a nightly-only feature. This can be a friction point in CI environments locked to stable.
+- **Regex-based leak detection** — public API exposure is checked by searching for `dep_name::` patterns in the `cargo public-api` output. Re-exports under a different path, blanket trait impls, or type aliases that hide the original crate path can be missed (false negatives) or, less likely, over-matched (false positives).
+- **Type-level only** — `semwave` detects leaked *types*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
+- **Complex version requirements are unsupported** — ranges (`>=1.2, <2`), wildcards (`1.*`), and multi-constraint specs are skipped during seed detection.
+- **Cargo workspaces only** — the tool is purpose-built for Rust/Cargo. It won't help with polyglot monorepos or non-Cargo Rust projects.
+- **`cargo public-api` failures are handled conservatively** — if a crate fails to build with `cargo public-api` (e.g., due to missing system deps or feature flags), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping.
 
 ## Installation
 
