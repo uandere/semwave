@@ -6,7 +6,7 @@ description = "Static analysis tool for semver bump propagation in Cargo workspa
 license = "MIT"
 repository = "https://github.com/uandere/semwave"
 readme = "README.md"
-keywords = ["semver", "versioning", "cargo", "workspace", "static-analysis", "bump"]
+keywords = ["semver", "versioning", "cargo", "static-analysis", "breaking-changes"]
 categories = ["development-tools::cargo-plugins"]
 
 [dependencies]
