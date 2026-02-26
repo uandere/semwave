@@ -28,8 +28,8 @@ use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Node, NodeDep, P
 use clap::Parser;
 use colored::Colorize;
 use rustdoc_types::{
-    AssocItemConstraintKind, GenericArg, GenericArgs, GenericBound, ItemEnum, Term, Type,
-    WherePredicate,
+    AssocItemConstraintKind, GenericArg, GenericArgs, GenericBound, ItemEnum, StructKind, Term,
+    Type, VariantKind, WherePredicate,
 };
 use semver::Version;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1150,22 +1150,15 @@ fn item_kind_label(item: &rustdoc_types::Item) -> &'static str {
     }
 }
 
-fn path_last_segment(p: &rustdoc_types::Path) -> String {
-    p.path.rsplit("::").next().unwrap_or("_").to_string()
-}
-
-fn type_display_name(
-    ty: &Type,
-    _paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> String {
+fn type_display_name(ty: &Type) -> String {
     match ty {
-        Type::ResolvedPath(p) => path_last_segment(p),
-        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_, _paths)),
-        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_, _paths)),
-        Type::Slice(inner) => format!("[{}]", type_display_name(inner, _paths)),
-        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_, _paths)),
+        Type::ResolvedPath(p) => p.path.clone(),
+        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_)),
+        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_)),
+        Type::Slice(inner) => format!("[{}]", type_display_name(inner)),
+        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_)),
         Type::Tuple(types) => {
-            let inner: Vec<_> = types.iter().map(|t| type_display_name(t, _paths)).collect();
+            let inner: Vec<_> = types.iter().map(type_display_name).collect();
             format!("({})", inner.join(", "))
         }
         Type::Generic(name) => name.clone(),
@@ -1173,19 +1166,19 @@ fn type_display_name(
         Type::QualifiedPath {
             name, self_type, ..
         } => {
-            format!("<{}>::{}", type_display_name(self_type, _paths), name)
+            format!("<{}>::{}", type_display_name(self_type), name)
         }
         Type::DynTrait(dt) => dt
             .traits
             .first()
-            .map(|p| format!("dyn {}", path_last_segment(&p.trait_)))
+            .map(|p| format!("dyn {}", p.trait_.path))
             .unwrap_or_else(|| "dyn ...".to_string()),
         Type::ImplTrait(bounds) => {
             let names: Vec<_> = bounds
                 .iter()
                 .filter_map(|b| {
                     if let GenericBound::TraitBound { trait_, .. } = b {
-                        Some(path_last_segment(trait_))
+                        Some(trait_.path.clone())
                     } else {
                         None
                     }
@@ -1201,27 +1194,79 @@ fn find_leaked_deps(
     krate: &rustdoc_types::Crate,
     dep_crate_ids: &HashMap<u32, String>,
 ) -> HashMap<String, Vec<LeakDetail>> {
+    let mut child_parents: HashMap<&rustdoc_types::Id, String> = HashMap::new();
+    for (id, item) in &krate.index {
+        let parent_path = krate
+            .paths
+            .get(id)
+            .map(|s| s.path.join("::"))
+            .or_else(|| item.name.clone())
+            .or_else(|| {
+                if let ItemEnum::Impl(imp) = &item.inner {
+                    let self_ty = type_display_name(&imp.for_);
+                    Some(match &imp.trait_ {
+                        Some(t) => format!("<{} as {}>", self_ty, t.path),
+                        None => self_ty,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let child_ids: Vec<&rustdoc_types::Id> = match &item.inner {
+            ItemEnum::Struct(s) => match &s.kind {
+                StructKind::Plain { fields, .. } => fields.iter().collect(),
+                StructKind::Tuple(fields) => fields.iter().filter_map(|f| f.as_ref()).collect(),
+                StructKind::Unit => vec![],
+            },
+            ItemEnum::Variant(v) => match &v.kind {
+                VariantKind::Plain => vec![],
+                VariantKind::Tuple(fields) => fields.iter().filter_map(|f| f.as_ref()).collect(),
+                VariantKind::Struct { fields, .. } => fields.iter().collect(),
+            },
+            ItemEnum::Impl(imp) => imp.items.iter().collect(),
+            ItemEnum::Trait(t) => t.items.iter().collect(),
+            _ => vec![],
+        };
+
+        for cid in child_ids {
+            child_parents.insert(cid, parent_path.clone());
+        }
+    }
+
     let mut result: HashMap<String, Vec<LeakDetail>> = HashMap::new();
 
-    for item in krate.index.values() {
+    for (id, item) in &krate.index {
         let refs = collect_crate_ids_from_item(item, krate);
-        let item_name = item
-            .name
-            .clone()
+        if refs.is_empty() {
+            continue;
+        }
+
+        let item_name = krate
+            .paths
+            .get(id)
+            .map(|s| s.path.join("::"))
+            .or_else(|| {
+                let child_name = item.name.as_deref().unwrap_or("?");
+                child_parents
+                    .get(id)
+                    .map(|parent| format!("{}::{}", parent, child_name))
+            })
             .or_else(|| match &item.inner {
                 ItemEnum::Use(use_) => use_
                     .id
                     .as_ref()
-                    .and_then(|id| krate.paths.get(id))
+                    .and_then(|uid| krate.paths.get(uid))
                     .map(|s| s.path.join("::")),
                 ItemEnum::Impl(imp) => {
-                    let self_ty = type_display_name(&imp.for_, &krate.paths);
+                    let self_ty = type_display_name(&imp.for_);
                     Some(match &imp.trait_ {
-                        Some(t) => format!("{} for {}", path_last_segment(t), self_ty),
+                        Some(t) => format!("{} for {}", t.path, self_ty),
                         None => self_ty,
                     })
                 }
-                _ => None,
+                _ => item.name.clone(),
             })
             .unwrap_or_else(|| "<unnamed>".to_string());
         let item_kind = item_kind_label(item);
