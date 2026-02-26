@@ -63,6 +63,10 @@ struct Cli {
     /// Print an influence tree showing how bumps propagate
     #[arg(long, short)]
     tree: bool,
+
+    /// Show cargo rustdoc stderr output (warnings, errors) during analysis
+    #[arg(long)]
+    rustdoc_stderr: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -275,6 +279,7 @@ fn main() -> Result<()> {
                     &additive_crates,
                     &mut failed,
                     cli.verbose,
+                    cli.rustdoc_stderr,
                 )?;
 
                 for inf in &influences {
@@ -940,6 +945,7 @@ fn evaluate_crate_bump(
     additive_crates: &HashSet<String>,
     failed: &mut HashSet<String>,
     verbose: bool,
+    rustdoc_stderr: bool,
 ) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
     let node_name = ctx.pkg_names[&node.id].clone();
     let node_version = ctx.pkg_versions.get(&node_name);
@@ -1000,7 +1006,7 @@ fn evaluate_crate_bump(
         .toolchain("nightly")
         .manifest_path(manifest)
         .cap_lints(Some("allow"))
-        .silent(true)
+        .silent(!rustdoc_stderr)
         .build()
     {
         Ok(path) => path,

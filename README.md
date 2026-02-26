@@ -81,10 +81,11 @@ Options:
       --source <SOURCE>  Source git ref to compare from (the base) [default: main]
       --target <TARGET>  Target git ref to compare to [default: HEAD]
       --direct <DIRECT>  Comma-separated crate names to treat as breaking-change seeds directly, skipping git-based version detection
-      --no-color         Disable colored output
-  -v, --verbose          Print which public API items cause each leak
-  -t, --tree             Print an influence tree showing how bumps propagate
-  -h, --help             Print help
+      --no-color             Disable colored output
+  -v, --verbose              Print which public API items cause each leak
+  -t, --tree                 Print an influence tree showing how bumps propagate
+      --rustdoc-stderr       Show cargo rustdoc stderr output (warnings, errors) during analysis
+  -h, --help                 Print help
 ```
 
 ## Examples
