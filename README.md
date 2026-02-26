@@ -41,7 +41,7 @@ flowchart LR
 
 ## The good
 
-- **Static analysis only** — no need to compile every dependent crate or run their test suites. The tool piggybacks on `cargo public-api` output and regex-based leak detection, so results arrive in seconds, not hours.
+- **Static analysis only** — no need to compile every dependent crate or run their test suites. The tool analyzes rustdoc JSON to detect leaked types, so results arrive in seconds, not hours.
 - **Transitive propagation** — a bump in crate A that leaks into crate B automatically makes B a new seed. The wave keeps going until no new leaks are found, catching cascading effects that humans routinely miss.
 - **Semver-scheme-aware** — correctly distinguishes `0.y.z` (where a minor bump is breaking) from `>=1.0.0` (where a minor bump is additive). Bump recommendations respect whichever scheme the consumer crate uses.
 - **Under-bump detection** — if a crate already has a version bump in the diff but that bump is *insufficient* (e.g., PATCH when MINOR is required), `semwave` flags it explicitly.
@@ -50,12 +50,11 @@ flowchart LR
 
 ## The bad
 
-- **Requires a nightly toolchain** — `cargo public-api` depends on rustdoc JSON output, which is a nightly-only feature. This can be a friction point in CI environments locked to stable.
-- **Regex-based leak detection** — public API exposure is checked by searching for `dep_name::` patterns in the `cargo public-api` output. Re-exports erase the original crate path (`pub use child::Child;` appears as `father::Child` in the output), so the regex misses them even though the crate genuinely leaks the dependency's type (false negative).
+- **Requires a nightly toolchain** — rustdoc JSON output is a nightly-only feature. This can be a friction point in CI environments locked to stable.
 - **Type-level only** — `semwave` detects leaked *types*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
 - **Complex version requirements are unsupported** — ranges (`>=1.2, <2`), wildcards (`1.*`), and multi-constraint specs are skipped during seed detection.
 - **Cargo workspaces only** — the tool is purpose-built for Rust/Cargo. It won't help with polyglot monorepos or non-Cargo Rust projects.
-- **`cargo public-api` failures are handled conservatively** — if a crate fails to build with `cargo public-api` (e.g., due to missing system deps or feature flags), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping.
+- **Rustdoc failures are handled conservatively** — if a crate fails to generate rustdoc JSON (e.g., due to missing system deps or feature flags), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping.
 
 ## Installation
 
@@ -65,11 +64,10 @@ cd semwave
 cargo install --path .
 ```
 
-You'll also need a nightly toolchain installed, since `cargo public-api` depends on it:
+You'll also need a nightly toolchain installed, since rustdoc JSON output is a nightly-only feature:
 
 ```sh
 rustup toolchain install nightly
-cargo +nightly install cargo-public-api
 ```
 
 ## Usage
@@ -84,7 +82,7 @@ Options:
       --target <TARGET>  Target git ref to compare to [default: HEAD]
       --direct <DIRECT>  Comma-separated crate names to treat as breaking-change seeds directly, skipping git-based version detection
       --no-color         Disable colored output
-  -v, --verbose          Print the public API lines that cause leaks
+  -v, --verbose          Print which public API items cause each leak
   -t, --tree             Print an influence tree showing how bumps propagate
   -h, --help             Print help
 ```

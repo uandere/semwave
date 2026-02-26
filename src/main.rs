@@ -27,7 +27,10 @@ use anyhow::{Context, Result};
 use cargo_metadata::{DependencyKind, MetadataCommand, Node, NodeDep, PackageId};
 use clap::Parser;
 use colored::Colorize;
-use regex::Regex;
+use rustdoc_types::{
+    AssocItemConstraintKind, GenericArg, GenericArgs, GenericBound, ItemEnum, Term, Type,
+    WherePredicate,
+};
 use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -53,7 +56,7 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
-    /// Print the public API lines that cause leaks
+    /// Print which public API items cause each leak
     #[arg(long, short)]
     verbose: bool,
 
@@ -432,7 +435,7 @@ fn main() -> Result<()> {
 
     if !failed.is_empty() {
         eprintln!(
-            "\n{} The following crates failed to build with `cargo public-api` \
+            "\n{} The following crates failed rustdoc JSON generation \
              and were conservatively assumed breaking. Verify manually:\n  {:?}",
             "WARNING:".yellow().bold(),
             failed
@@ -927,7 +930,7 @@ fn is_normal_dep(dep: &NodeDep) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluate public API exposure
+// Evaluate public API exposure via rustdoc JSON analysis
 // ---------------------------------------------------------------------------
 
 fn evaluate_crate_bump(
@@ -993,68 +996,72 @@ fn evaluate_crate_bump(
         .get(&node_name)
         .with_context(|| format!("No manifest path for {}", node_name))?;
 
-    let output = Command::new("cargo")
-        .args([
-            "+nightly",
-            "public-api",
-            "--manifest-path",
-            manifest,
-            "--simplified",
-        ])
-        .output()
-        .with_context(|| format!("Failed to run cargo public-api on {}", node_name))?;
+    let json_path = match rustdoc_json::Builder::default()
+        .toolchain("nightly")
+        .manifest_path(manifest)
+        .cap_lints(Some("allow"))
+        .silent(true)
+        .build()
+    {
+        Ok(path) => path,
+        Err(e) => {
+            let worst_change = affected_deps
+                .iter()
+                .map(|(_, ck)| *ck)
+                .max()
+                .unwrap_or(ChangeKind::Breaking);
+            let conservative_bump = node_version
+                .map(|v| required_bump(v, worst_change))
+                .unwrap_or(Bump::Minor);
+            eprintln!(
+                "  {} rustdoc JSON generation failed for {}: {}\n  \
+                 Conservatively assuming {:?} bump.",
+                "WARNING:".yellow().bold(),
+                node_name.cyan(),
+                e,
+                conservative_bump
+            );
+            failed.insert(node_name);
+            let influences = affected_deps
+                .into_iter()
+                .map(|(dep_name, _)| DepInfluence {
+                    dep_name,
+                    bump: conservative_bump,
+                })
+                .collect();
+            return Ok((worst_change, conservative_bump, influences));
+        }
+    };
 
-    if !output.status.success() {
-        let stderr_text = String::from_utf8_lossy(&output.stderr);
-        let last_meaningful_line = stderr_text
-            .lines()
-            .rev()
-            .find(|l| !l.is_empty())
-            .unwrap_or("(no stderr)");
-        let worst_change = affected_deps
-            .iter()
-            .map(|(_, ck)| *ck)
-            .max()
-            .unwrap_or(ChangeKind::Breaking);
-        let conservative_bump = node_version
-            .map(|v| required_bump(v, worst_change))
-            .unwrap_or(Bump::Minor);
-        eprintln!(
-            "  {} cargo public-api failed for {}: {}\n  \
-             Conservatively assuming {:?} bump.",
-            "WARNING:".yellow().bold(),
-            node_name.cyan(),
-            last_meaningful_line,
-            conservative_bump
-        );
-        failed.insert(node_name);
-        let influences = affected_deps
-            .into_iter()
-            .map(|(dep_name, _)| DepInfluence {
-                dep_name,
-                bump: conservative_bump,
-            })
-            .collect();
-        return Ok((worst_change, conservative_bump, influences));
-    }
+    let json_str = std::fs::read_to_string(&json_path)
+        .with_context(|| format!("Failed to read rustdoc JSON for {}", node_name))?;
+    let krate: rustdoc_types::Crate = serde_json::from_str(&json_str)
+        .with_context(|| format!("Failed to parse rustdoc JSON for {}", node_name))?;
 
-    let api_text = String::from_utf8_lossy(&output.stdout);
+    let dep_norm_set: HashSet<String> = affected_deps
+        .iter()
+        .map(|(n, _)| n.replace('-', "_"))
+        .collect();
+
+    let dep_crate_id_to_name: HashMap<u32, String> = krate
+        .external_crates
+        .iter()
+        .filter(|(_, ec)| dep_norm_set.contains(&ec.name.replace('-', "_")))
+        .map(|(id, ec)| (*id, ec.name.clone()))
+        .collect();
+
+    let leaked = find_leaked_deps(&krate, &dep_crate_id_to_name);
 
     let mut worst_change = ChangeKind::Patch;
     let mut influences = Vec::new();
 
     for (dep_name, dep_change) in affected_deps {
-        let mod_name = dep_name.replace('-', "_");
+        let dep_norm = dep_name.replace('-', "_");
+        let is_leaked = leaked.keys().any(|k| k.replace('-', "_") == dep_norm);
 
-        let pattern = format!(r"(?:^|[^a-zA-Z0-9_:]){}::", regex::escape(&mod_name));
-        let re = Regex::new(&pattern)?;
-
-        let matching_lines: Vec<&str> = api_text.lines().filter(|line| re.is_match(line)).collect();
-
-        if !matching_lines.is_empty() {
-            let edge_change = dep_change;
+        if is_leaked {
             let edge_bump = node_version
-                .map(|v| required_bump(v, edge_change))
+                .map(|v| required_bump(v, dep_change))
                 .unwrap_or(Bump::Minor);
             println!(
                 "  {} {} leaks {} ({:?}):",
@@ -1064,15 +1071,19 @@ fn evaluate_crate_bump(
                 edge_bump
             );
             if verbose {
-                for line in &matching_lines {
-                    println!("     {}", line.dimmed());
+                for (leaked_name, items) in &leaked {
+                    if leaked_name.replace('-', "_") == dep_norm {
+                        for item in items {
+                            println!("     {}", item.dimmed());
+                        }
+                    }
                 }
             }
             influences.push(DepInfluence {
                 dep_name,
                 bump: edge_bump,
             });
-            worst_change = worst_change.max(edge_change);
+            worst_change = worst_change.max(dep_change);
         } else {
             influences.push(DepInfluence {
                 dep_name,
@@ -1086,4 +1097,300 @@ fn evaluate_crate_bump(
         .unwrap_or(Bump::Patch);
 
     Ok((worst_change, final_bump, influences))
+}
+
+/// Walk the entire rustdoc JSON index and find which target deps are leaked
+/// in the public API. Returns a map from dep name to the list of item names
+/// that expose it.
+fn find_leaked_deps(
+    krate: &rustdoc_types::Crate,
+    dep_crate_ids: &HashMap<u32, String>,
+) -> HashMap<String, Vec<String>> {
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+    for item in krate.index.values() {
+        let referenced_crate_ids = collect_crate_ids_from_item(item, krate);
+        let item_name = item.name.as_deref().unwrap_or("<unnamed>");
+
+        for crate_id in referenced_crate_ids {
+            if let Some(dep_name) = dep_crate_ids.get(&crate_id) {
+                result
+                    .entry(dep_name.clone())
+                    .or_default()
+                    .push(item_name.to_string());
+            }
+        }
+    }
+
+    result
+}
+
+/// Collect all external crate IDs referenced by a single item.
+fn collect_crate_ids_from_item(
+    item: &rustdoc_types::Item,
+    krate: &rustdoc_types::Crate,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+
+    match &item.inner {
+        ItemEnum::Use(use_) => {
+            if let Some(ref target_id) = use_.id
+                && let Some(summary) = krate.paths.get(target_id)
+            {
+                ids.insert(summary.crate_id);
+            }
+        }
+        ItemEnum::Function(f) => {
+            ids.extend(collect_crate_ids_from_fn_sig(&f.sig, &krate.paths));
+            ids.extend(collect_crate_ids_from_generics(&f.generics, &krate.paths));
+        }
+        ItemEnum::Struct(s) => {
+            ids.extend(collect_crate_ids_from_generics(&s.generics, &krate.paths));
+        }
+        ItemEnum::StructField(ty) => {
+            ids.extend(collect_crate_ids_from_type(ty, &krate.paths));
+        }
+        ItemEnum::Enum(e) => {
+            ids.extend(collect_crate_ids_from_generics(&e.generics, &krate.paths));
+        }
+        ItemEnum::Variant(_) => {}
+        ItemEnum::Union(u) => {
+            ids.extend(collect_crate_ids_from_generics(&u.generics, &krate.paths));
+        }
+        ItemEnum::TypeAlias(ta) => {
+            ids.extend(collect_crate_ids_from_type(&ta.type_, &krate.paths));
+            ids.extend(collect_crate_ids_from_generics(&ta.generics, &krate.paths));
+        }
+        ItemEnum::Trait(t) => {
+            ids.extend(collect_crate_ids_from_generics(&t.generics, &krate.paths));
+            for bound in &t.bounds {
+                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
+            }
+        }
+        ItemEnum::TraitAlias(ta) => {
+            ids.extend(collect_crate_ids_from_generics(&ta.generics, &krate.paths));
+            for bound in &ta.params {
+                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
+            }
+        }
+        ItemEnum::Impl(imp) => {
+            ids.extend(collect_crate_ids_from_generics(&imp.generics, &krate.paths));
+            ids.extend(collect_crate_ids_from_type(&imp.for_, &krate.paths));
+            if let Some(ref trait_path) = imp.trait_ {
+                ids.extend(collect_crate_ids_from_path(trait_path, &krate.paths));
+            }
+        }
+        ItemEnum::Constant { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, &krate.paths));
+        }
+        ItemEnum::Static(s) => {
+            ids.extend(collect_crate_ids_from_type(&s.type_, &krate.paths));
+        }
+        ItemEnum::AssocConst { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, &krate.paths));
+        }
+        ItemEnum::AssocType {
+            generics,
+            bounds,
+            type_,
+        } => {
+            ids.extend(collect_crate_ids_from_generics(generics, &krate.paths));
+            for bound in bounds {
+                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
+            }
+            if let Some(ty) = type_ {
+                ids.extend(collect_crate_ids_from_type(ty, &krate.paths));
+            }
+        }
+        ItemEnum::Module(_)
+        | ItemEnum::ExternCrate { .. }
+        | ItemEnum::ExternType
+        | ItemEnum::Macro(_)
+        | ItemEnum::ProcMacro(_)
+        | ItemEnum::Primitive(_) => {}
+    }
+
+    ids.remove(&0);
+    ids
+}
+
+fn collect_crate_ids_from_fn_sig(
+    sig: &rustdoc_types::FunctionSignature,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    for (_, ty) in &sig.inputs {
+        ids.extend(collect_crate_ids_from_type(ty, paths));
+    }
+    if let Some(ref out) = sig.output {
+        ids.extend(collect_crate_ids_from_type(out, paths));
+    }
+    ids
+}
+
+fn collect_crate_ids_from_type(
+    ty: &Type,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    match ty {
+        Type::ResolvedPath(path) => {
+            ids.extend(collect_crate_ids_from_path(path, paths));
+        }
+        Type::DynTrait(dyn_trait) => {
+            for poly in &dyn_trait.traits {
+                ids.extend(collect_crate_ids_from_path(&poly.trait_, paths));
+            }
+        }
+        Type::FunctionPointer(fp) => {
+            ids.extend(collect_crate_ids_from_fn_sig(&fp.sig, paths));
+        }
+        Type::Tuple(types) => {
+            for t in types {
+                ids.extend(collect_crate_ids_from_type(t, paths));
+            }
+        }
+        Type::Slice(inner) => {
+            ids.extend(collect_crate_ids_from_type(inner, paths));
+        }
+        Type::Array { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, paths));
+        }
+        Type::Pat { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, paths));
+        }
+        Type::ImplTrait(bounds) => {
+            for bound in bounds {
+                ids.extend(collect_crate_ids_from_bound(bound, paths));
+            }
+        }
+        Type::RawPointer { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, paths));
+        }
+        Type::BorrowedRef { type_, .. } => {
+            ids.extend(collect_crate_ids_from_type(type_, paths));
+        }
+        Type::QualifiedPath {
+            self_type,
+            trait_,
+            args,
+            ..
+        } => {
+            ids.extend(collect_crate_ids_from_type(self_type, paths));
+            if let Some(trait_path) = trait_ {
+                ids.extend(collect_crate_ids_from_path(trait_path, paths));
+            }
+            if let Some(ga) = args {
+                ids.extend(collect_crate_ids_from_generic_args(ga, paths));
+            }
+        }
+        Type::Generic(_) | Type::Primitive(_) | Type::Infer => {}
+    }
+    ids
+}
+
+fn collect_crate_ids_from_path(
+    path: &rustdoc_types::Path,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    if let Some(summary) = paths.get(&path.id) {
+        ids.insert(summary.crate_id);
+    }
+    if let Some(ref args) = path.args {
+        ids.extend(collect_crate_ids_from_generic_args(args, paths));
+    }
+    ids
+}
+
+fn collect_crate_ids_from_generic_args(
+    args: &GenericArgs,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    match args {
+        GenericArgs::AngleBracketed { args, constraints } => {
+            for arg in args {
+                match arg {
+                    GenericArg::Type(ty) => {
+                        ids.extend(collect_crate_ids_from_type(ty, paths));
+                    }
+                    GenericArg::Lifetime(_) | GenericArg::Const(_) | GenericArg::Infer => {}
+                }
+            }
+            for constraint in constraints {
+                match &constraint.binding {
+                    AssocItemConstraintKind::Equality(term) => {
+                        if let Term::Type(ty) = term {
+                            ids.extend(collect_crate_ids_from_type(ty, paths));
+                        }
+                    }
+                    AssocItemConstraintKind::Constraint(bounds) => {
+                        for bound in bounds {
+                            ids.extend(collect_crate_ids_from_bound(bound, paths));
+                        }
+                    }
+                }
+            }
+        }
+        GenericArgs::Parenthesized { inputs, output } => {
+            for ty in inputs {
+                ids.extend(collect_crate_ids_from_type(ty, paths));
+            }
+            if let Some(ty) = output {
+                ids.extend(collect_crate_ids_from_type(ty, paths));
+            }
+        }
+        GenericArgs::ReturnTypeNotation => {}
+    }
+    ids
+}
+
+fn collect_crate_ids_from_bound(
+    bound: &GenericBound,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    if let GenericBound::TraitBound { trait_, .. } = bound {
+        ids.extend(collect_crate_ids_from_path(trait_, paths));
+    }
+    ids
+}
+
+fn collect_crate_ids_from_generics(
+    generics: &rustdoc_types::Generics,
+    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    for param in &generics.params {
+        if let rustdoc_types::GenericParamDefKind::Type {
+            bounds, default, ..
+        } = &param.kind
+        {
+            for bound in bounds {
+                ids.extend(collect_crate_ids_from_bound(bound, paths));
+            }
+            if let Some(ty) = default {
+                ids.extend(collect_crate_ids_from_type(ty, paths));
+            }
+        }
+    }
+    for pred in &generics.where_predicates {
+        match pred {
+            WherePredicate::BoundPredicate { type_, bounds, .. } => {
+                ids.extend(collect_crate_ids_from_type(type_, paths));
+                for bound in bounds {
+                    ids.extend(collect_crate_ids_from_bound(bound, paths));
+                }
+            }
+            WherePredicate::EqPredicate { lhs, rhs } => {
+                ids.extend(collect_crate_ids_from_type(lhs, paths));
+                if let Term::Type(ty) = rhs {
+                    ids.extend(collect_crate_ids_from_type(ty, paths));
+                }
+            }
+            WherePredicate::LifetimePredicate { .. } => {}
+        }
+    }
+    ids
 }
