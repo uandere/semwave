@@ -32,7 +32,7 @@ use rustdoc_types::{
     WherePredicate,
 };
 use semver::Version;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -91,6 +91,13 @@ enum ChangeKind {
 struct DepInfluence {
     dep_name: String,
     bump: Bump,
+}
+
+/// One public API item that leaks an external dependency.
+struct LeakDetail {
+    item_name: String,
+    item_kind: &'static str,
+    leaked_types: BTreeSet<String>,
 }
 
 /// Return type for `detect_version_changes`: (breaking_seeds, additive_seeds, local_bumps).
@@ -1079,10 +1086,21 @@ fn evaluate_crate_bump(
                 edge_bump
             );
             if verbose {
-                for (leaked_name, items) in &leaked {
+                for (leaked_name, details) in &leaked {
                     if leaked_name.replace('-', "_") == dep_norm {
-                        for item in items {
-                            println!("     {}", item.dimmed());
+                        for detail in details {
+                            let types_str = detail
+                                .leaked_types
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!(
+                                "     {} {} — uses {}",
+                                detail.item_kind.dimmed(),
+                                detail.item_name.dimmed(),
+                                types_str.dimmed()
+                            );
                         }
                     }
                 }
@@ -1110,34 +1128,135 @@ fn evaluate_crate_bump(
 /// Walk the entire rustdoc JSON index and find which target deps are leaked
 /// in the public API. Returns a map from dep name to the list of item names
 /// that expose it.
+fn item_kind_label(item: &rustdoc_types::Item) -> &'static str {
+    match &item.inner {
+        ItemEnum::Use(_) => "re-export",
+        ItemEnum::Function(_) => "fn",
+        ItemEnum::Struct(_) => "struct",
+        ItemEnum::StructField(_) => "field",
+        ItemEnum::Enum(_) => "enum",
+        ItemEnum::Variant(_) => "variant",
+        ItemEnum::Union(_) => "union",
+        ItemEnum::TypeAlias(_) => "type",
+        ItemEnum::Trait(_) => "trait",
+        ItemEnum::TraitAlias(_) => "trait alias",
+        ItemEnum::Impl(_) => "impl",
+        ItemEnum::Constant { .. } => "const",
+        ItemEnum::Static(_) => "static",
+        ItemEnum::AssocConst { .. } => "assoc const",
+        ItemEnum::AssocType { .. } => "assoc type",
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => "macro",
+        _ => "item",
+    }
+}
+
+fn path_last_segment(p: &rustdoc_types::Path) -> String {
+    p.path.rsplit("::").next().unwrap_or("_").to_string()
+}
+
+fn type_display_name(
+    ty: &Type,
+    _paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
+) -> String {
+    match ty {
+        Type::ResolvedPath(p) => path_last_segment(p),
+        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_, _paths)),
+        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_, _paths)),
+        Type::Slice(inner) => format!("[{}]", type_display_name(inner, _paths)),
+        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_, _paths)),
+        Type::Tuple(types) => {
+            let inner: Vec<_> = types.iter().map(|t| type_display_name(t, _paths)).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Generic(name) => name.clone(),
+        Type::Primitive(name) => name.clone(),
+        Type::QualifiedPath {
+            name, self_type, ..
+        } => {
+            format!("<{}>::{}", type_display_name(self_type, _paths), name)
+        }
+        Type::DynTrait(dt) => dt
+            .traits
+            .first()
+            .map(|p| format!("dyn {}", path_last_segment(&p.trait_)))
+            .unwrap_or_else(|| "dyn ...".to_string()),
+        Type::ImplTrait(bounds) => {
+            let names: Vec<_> = bounds
+                .iter()
+                .filter_map(|b| {
+                    if let GenericBound::TraitBound { trait_, .. } = b {
+                        Some(path_last_segment(trait_))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            format!("impl {}", names.join(" + "))
+        }
+        _ => "_".to_string(),
+    }
+}
+
 fn find_leaked_deps(
     krate: &rustdoc_types::Crate,
     dep_crate_ids: &HashMap<u32, String>,
-) -> HashMap<String, Vec<String>> {
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+) -> HashMap<String, Vec<LeakDetail>> {
+    let mut result: HashMap<String, Vec<LeakDetail>> = HashMap::new();
 
     for item in krate.index.values() {
-        let referenced_crate_ids = collect_crate_ids_from_item(item, krate);
-        let item_name = item.name.as_deref().unwrap_or("<unnamed>");
+        let refs = collect_crate_ids_from_item(item, krate);
+        let item_name = item
+            .name
+            .clone()
+            .or_else(|| match &item.inner {
+                ItemEnum::Use(use_) => use_
+                    .id
+                    .as_ref()
+                    .and_then(|id| krate.paths.get(id))
+                    .map(|s| s.path.join("::")),
+                ItemEnum::Impl(imp) => {
+                    let self_ty = type_display_name(&imp.for_, &krate.paths);
+                    Some(match &imp.trait_ {
+                        Some(t) => format!("{} for {}", path_last_segment(t), self_ty),
+                        None => self_ty,
+                    })
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let item_kind = item_kind_label(item);
 
-        for crate_id in referenced_crate_ids {
+        let mut per_dep: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (crate_id, type_path) in refs {
             if let Some(dep_name) = dep_crate_ids.get(&crate_id) {
-                result
+                per_dep
                     .entry(dep_name.clone())
                     .or_default()
-                    .push(item_name.to_string());
+                    .insert(type_path);
             }
         }
+
+        for (dep_name, leaked_types) in per_dep {
+            result.entry(dep_name).or_default().push(LeakDetail {
+                item_name: item_name.clone(),
+                item_kind,
+                leaked_types,
+            });
+        }
+    }
+
+    for details in result.values_mut() {
+        details.sort_by(|a, b| a.item_name.cmp(&b.item_name));
     }
 
     result
 }
 
-/// Collect all external crate IDs referenced by a single item.
+/// Collect all external crate IDs (with type paths) referenced by a single item.
 fn collect_crate_ids_from_item(
     item: &rustdoc_types::Item,
     krate: &rustdoc_types::Crate,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
 
     match &item.inner {
@@ -1145,7 +1264,7 @@ fn collect_crate_ids_from_item(
             if let Some(ref target_id) = use_.id
                 && let Some(summary) = krate.paths.get(target_id)
             {
-                ids.insert(summary.crate_id);
+                ids.insert((summary.crate_id, summary.path.join("::")));
             }
         }
         ItemEnum::Function(f) => {
@@ -1218,14 +1337,14 @@ fn collect_crate_ids_from_item(
         | ItemEnum::Primitive(_) => {}
     }
 
-    ids.remove(&0);
+    ids.retain(|(id, _)| *id != 0);
     ids
 }
 
 fn collect_crate_ids_from_fn_sig(
     sig: &rustdoc_types::FunctionSignature,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     for (_, ty) in &sig.inputs {
         ids.extend(collect_crate_ids_from_type(ty, paths));
@@ -1239,7 +1358,7 @@ fn collect_crate_ids_from_fn_sig(
 fn collect_crate_ids_from_type(
     ty: &Type,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     match ty {
         Type::ResolvedPath(path) => {
@@ -1300,10 +1419,10 @@ fn collect_crate_ids_from_type(
 fn collect_crate_ids_from_path(
     path: &rustdoc_types::Path,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     if let Some(summary) = paths.get(&path.id) {
-        ids.insert(summary.crate_id);
+        ids.insert((summary.crate_id, summary.path.join("::")));
     }
     if let Some(ref args) = path.args {
         ids.extend(collect_crate_ids_from_generic_args(args, paths));
@@ -1314,7 +1433,7 @@ fn collect_crate_ids_from_path(
 fn collect_crate_ids_from_generic_args(
     args: &GenericArgs,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     match args {
         GenericArgs::AngleBracketed { args, constraints } => {
@@ -1357,7 +1476,7 @@ fn collect_crate_ids_from_generic_args(
 fn collect_crate_ids_from_bound(
     bound: &GenericBound,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     if let GenericBound::TraitBound { trait_, .. } = bound {
         ids.extend(collect_crate_ids_from_path(trait_, paths));
@@ -1368,7 +1487,7 @@ fn collect_crate_ids_from_bound(
 fn collect_crate_ids_from_generics(
     generics: &rustdoc_types::Generics,
     paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<u32> {
+) -> HashSet<(u32, String)> {
     let mut ids = HashSet::new();
     for param in &generics.params {
         if let rustdoc_types::GenericParamDefKind::Type {
