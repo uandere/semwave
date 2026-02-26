@@ -2,7 +2,7 @@
 //!
 //! A static analysis tool that answers the question:
 //!
-//! > *"If I bump crates A, B and C in this Rust project — what else do I need to bump and how?"*
+//! > *"If I bump crates A, B and C in this Rust project - what else do I need to bump and how?"*
 //!
 //! ## How it works
 //!
@@ -13,7 +13,7 @@
 //!
 //! 2. Walks the workspace dependency graph starting from the seeds. For each dependent,
 //!    it checks whether the crate leaks any seed types in its public API. If it does,
-//!    that crate itself needs a bump — and becomes a new seed, triggering the same check
+//!    that crate itself needs a bump - and becomes a new seed, triggering the same check
 //!    on *its* dependents, and so on until the wave settles. The bump level
 //!    (major/minor/patch) depends on the change type and the consumer's version scheme
 //!    (`0.y.z` vs `>=1.0.0`).
@@ -24,7 +24,7 @@
 #![allow(clippy::format_in_format_args)]
 
 use anyhow::{Context, Result};
-use cargo_metadata::{DependencyKind, MetadataCommand, Node, NodeDep, PackageId};
+use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Node, NodeDep, PackageId};
 use clap::Parser;
 use colored::Colorize;
 use rustdoc_types::{
@@ -212,6 +212,7 @@ fn main() -> Result<()> {
     let mut tree_edges: HashMap<String, Vec<(String, Bump)>> = HashMap::new();
 
     let metadata = MetadataCommand::new()
+        .features(CargoOpt::AllFeatures)
         .exec()
         .context("Failed to run cargo metadata")?;
 
@@ -343,7 +344,7 @@ fn main() -> Result<()> {
                     eprintln!("  {}", name.cyan());
                 }
             }
-            anyhow::bail!("Cannot make progress — cycle in workspace dependencies");
+            anyhow::bail!("Cannot make progress - cycle in workspace dependencies");
         }
     }
 
@@ -1005,6 +1006,7 @@ fn evaluate_crate_bump(
     let json_path = match rustdoc_json::Builder::default()
         .toolchain("nightly")
         .manifest_path(manifest)
+        .all_features(true)
         .cap_lints(Some("allow"))
         .silent(!rustdoc_stderr)
         .build()
