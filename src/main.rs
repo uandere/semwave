@@ -381,8 +381,11 @@ fn main() -> Result<()> {
         .chain(patch_list.iter().map(|n| (n, Bump::Patch)))
         .collect();
 
+    let mut has_errors = false;
+
     let under_bumped: Vec<(&String, Bump, &Bump)> = all_required
         .iter()
+        .filter(|(name, _)| !failed.contains(**name))
         .filter_map(|(name, required)| {
             local_bumps
                 .get(*name)
@@ -391,6 +394,7 @@ fn main() -> Result<()> {
         })
         .collect();
     if !under_bumped.is_empty() {
+        has_errors = true;
         eprintln!(
             "\n{} These crates have insufficient version bumps:",
             "ERROR:".red().bold()
@@ -403,6 +407,28 @@ fn main() -> Result<()> {
                 required
             );
         }
+    }
+
+    if !local_bumps.is_empty() {
+        let missing: Vec<(&String, &Bump)> = all_required
+            .iter()
+            .filter(|(name, _)| !local_bumps.contains_key(**name) && !failed.contains(**name))
+            .map(|(name, bump)| (*name, bump))
+            .collect();
+        if !missing.is_empty() {
+            has_errors = true;
+            eprintln!(
+                "\n{} These crates need a version bump but have none:",
+                "ERROR:".red().bold()
+            );
+            for (name, required) in &missing {
+                eprintln!("  {} requires {:?}", name.cyan(), required);
+            }
+        }
+    }
+
+    if has_errors {
+        std::process::exit(1);
     }
 
     Ok(())
