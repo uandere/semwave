@@ -20,15 +20,22 @@
 //!
 //! The output is three lists: **MAJOR** bumps, **MINOR** bumps, and **PATCH** bumps,
 //! plus optional warnings when the tool had to guess conservatively.
+//!
+//! Read [README.md](https://github.com/uandere/semwave/blob/main/README.md) for more details.
 
 #![allow(clippy::format_in_format_args)]
 
+/// Print helpers
 pub mod display;
+/// Bump evaluation
 pub mod evaluate;
 /// Cycle detection (DFS-based)
 pub mod graph;
+/// Leak handling
 pub mod leak;
+/// Seed detection & management
 pub mod seeds;
+/// Semver helpers
 pub mod semver;
 
 use anyhow::{Context, Result};
