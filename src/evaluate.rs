@@ -1,21 +1,41 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    is_normal_dep,
     leak::find_leaked_deps,
     semver::{Bump, ChangeKind, required_bump},
 };
 use anyhow::{Context, Result};
-use cargo_metadata::{Node, PackageId};
+use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
 use colored::Colorize as _;
 use semver::Version;
 
-/// Shared read-only context passed to `evaluate_crate_bump` to avoid too many arguments.
+/// Returns true if this dependency edge includes a Normal (non-dev, non-build)
+/// dependency kind. Only normal deps affect the public API and semver surface.
+pub fn is_normal_dep(dep: &NodeDep) -> bool {
+    dep.dep_kinds
+        .iter()
+        .any(|dk| dk.kind == DependencyKind::Normal)
+}
+
+/// Shared read-only context about the workspace, built once from `cargo metadata`.
 pub struct WorkspaceContext {
     pub pkg_names: HashMap<PackageId, String>,
     pub pkg_manifest_paths: HashMap<String, String>,
     pub pkg_has_lib: HashSet<String>,
     pub pkg_versions: HashMap<String, Version>,
+}
+
+/// Mutable state accumulated during the propagation wave.
+pub struct WaveState {
+    pub breaking_crates: HashSet<String>,
+    pub additive_crates: HashSet<String>,
+    pub failed: HashSet<String>,
+}
+
+/// Per-crate analysis options.
+pub struct AnalysisOptions {
+    pub verbose: bool,
+    pub rustdoc_stderr: bool,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
@@ -28,24 +48,21 @@ pub struct DepInfluence {
 pub fn evaluate_crate_bump(
     node: &Node,
     ctx: &WorkspaceContext,
-    breaking_crates: &HashSet<String>,
-    additive_crates: &HashSet<String>,
-    failed: &mut HashSet<String>,
-    verbose: bool,
-    rustdoc_stderr: bool,
+    state: &mut WaveState,
+    opts: &AnalysisOptions,
 ) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
-    let node_name = ctx.pkg_names[&node.id].clone();
-    let node_version = ctx.pkg_versions.get(&node_name);
+    let node_name = &ctx.pkg_names[&node.id];
+    let node_version = ctx.pkg_versions.get(node_name);
 
-    let affected_deps: Vec<(String, ChangeKind)> = node
+    let affected_deps: Vec<(&str, ChangeKind)> = node
         .deps
         .iter()
         .filter(|d| d.pkg != node.id && is_normal_dep(d))
-        .map(|d| ctx.pkg_names[&d.pkg].clone())
-        .filter_map(|name| {
-            if breaking_crates.contains(&name) {
+        .filter_map(|d| {
+            let name = ctx.pkg_names[&d.pkg].as_str();
+            if state.breaking_crates.contains(name) {
                 Some((name, ChangeKind::Breaking))
-            } else if additive_crates.contains(&name) {
+            } else if state.additive_crates.contains(name) {
                 Some((name, ChangeKind::Additive))
             } else {
                 None
@@ -57,9 +74,9 @@ pub fn evaluate_crate_bump(
         return Ok((ChangeKind::None, Bump::None, vec![]));
     }
 
-    let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| n.as_str()).collect();
+    let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| *n).collect();
 
-    if !ctx.pkg_has_lib.contains(&node_name) {
+    if !ctx.pkg_has_lib.contains(node_name) {
         println!(
             "  {} {} is binary-only, no public API to leak",
             "->".dimmed(),
@@ -71,7 +88,7 @@ pub fn evaluate_crate_bump(
         let influences = affected_deps
             .into_iter()
             .map(|(dep_name, _)| DepInfluence {
-                dep_name,
+                dep_name: dep_name.to_owned(),
                 bump: Bump::Patch,
             })
             .collect();
@@ -79,14 +96,14 @@ pub fn evaluate_crate_bump(
     }
 
     println!(
-        "Analyzing {} for public API exposure of {}",
+        "Analyzing {} for public API exposure of {:?}",
         node_name.cyan().bold(),
-        format!("{:?}", dep_names).dimmed()
+        dep_names
     );
 
     let manifest = ctx
         .pkg_manifest_paths
-        .get(&node_name)
+        .get(node_name)
         .with_context(|| format!("No manifest path for {}", node_name))?;
 
     let json_path = match rustdoc_json::Builder::default()
@@ -94,7 +111,7 @@ pub fn evaluate_crate_bump(
         .manifest_path(manifest)
         .all_features(true)
         .cap_lints(Some("allow"))
-        .silent(!rustdoc_stderr)
+        .silent(!opts.rustdoc_stderr)
         .build()
     {
         Ok(path) => path,
@@ -109,17 +126,17 @@ pub fn evaluate_crate_bump(
                 .unwrap_or(Bump::Minor);
             eprintln!(
                 "  {} rustdoc JSON generation failed for {}: {}\n  \
-                 Conservatively assuming {:?} bump.",
+                 Conservatively assuming {} bump.",
                 "WARNING:".yellow().bold(),
                 node_name.cyan(),
                 e,
                 conservative_bump
             );
-            failed.insert(node_name);
+            state.failed.insert(node_name.to_owned());
             let influences = affected_deps
                 .into_iter()
                 .map(|(dep_name, _)| DepInfluence {
-                    dep_name,
+                    dep_name: dep_name.to_owned(),
                     bump: conservative_bump,
                 })
                 .collect();
@@ -158,13 +175,13 @@ pub fn evaluate_crate_bump(
                 .map(|v| required_bump(v, dep_change))
                 .unwrap_or(Bump::Minor);
             println!(
-                "  {} {} leaks {} ({:?}):",
+                "  {} {} leaks {} ({}):",
                 "->".red().bold(),
                 node_name.red().bold(),
                 dep_name.yellow(),
                 edge_bump
             );
-            if verbose {
+            if opts.verbose {
                 for (leaked_name, details) in &leaked {
                     if leaked_name.replace('-', "_") == dep_norm {
                         for detail in details {
@@ -185,13 +202,13 @@ pub fn evaluate_crate_bump(
                 }
             }
             influences.push(DepInfluence {
-                dep_name,
+                dep_name: dep_name.to_owned(),
                 bump: edge_bump,
             });
             worst_change = worst_change.max(dep_change);
         } else {
             influences.push(DepInfluence {
-                dep_name,
+                dep_name: dep_name.to_owned(),
                 bump: Bump::Patch,
             });
         }

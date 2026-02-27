@@ -28,7 +28,7 @@ pub fn print_influence_tree(
     }
 }
 
-pub fn print_tree_children(
+fn print_tree_children(
     parent: &str,
     tree_edges: &HashMap<String, Vec<(String, Bump)>>,
     prefix: &str,
@@ -72,11 +72,11 @@ pub fn print_tree_children(
         visited.insert(child.clone());
 
         println!(
-            "{}{}{}  {}",
+            "{}{}{}  ({})",
             prefix.dimmed(),
             colored_connector,
             child.cyan().bold(),
-            format!("({})", bump_label)
+            bump_label
         );
 
         let next_prefix = format!("{}{}", prefix, child_prefix);

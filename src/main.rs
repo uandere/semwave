@@ -1,4 +1,4 @@
-//! # 🌊 semwave
+//! # semwave
 //!
 //! A static analysis tool that answers the question:
 //!
@@ -23,20 +23,16 @@
 //!
 //! Read [README.md](https://github.com/uandere/semwave/blob/main/README.md) for more details.
 
-#![allow(clippy::format_in_format_args)]
-
 /// Print helpers
-pub mod display;
+mod display;
 /// Bump evaluation
-pub mod evaluate;
-/// Cycle detection (DFS-based)
-pub mod graph;
+mod evaluate;
 /// Leak handling
-pub mod leak;
+mod leak;
 /// Seed detection & management
-pub mod seeds;
+mod seeds;
 /// Semver helpers
-pub mod semver;
+mod semver;
 
 use anyhow::{Context, Result};
 use cargo_metadata::{CargoOpt, MetadataCommand, Node, PackageId};
@@ -45,10 +41,11 @@ use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 
 use crate::display::print_influence_tree;
-use crate::evaluate::{WorkspaceContext, evaluate_crate_bump};
-use crate::graph::{find_cycle, is_normal_dep};
+use crate::evaluate::{
+    AnalysisOptions, WaveState, WorkspaceContext, evaluate_crate_bump, is_normal_dep,
+};
 use crate::seeds::detect_version_changes;
-use crate::semver::{Bump, ChangeKind, required_bump};
+use crate::semver::{Bump, ChangeKind, format_name_set, required_bump};
 
 #[derive(Parser)]
 #[command(about = "Determine semver bump requirements for workspace crates.")]
@@ -90,24 +87,33 @@ fn main() -> Result<()> {
         colored::control::set_override(false);
     }
 
-    let (breaking_seeds, additive_seeds, local_bumps) = if let Some(direct_crates) = cli.direct {
+    let opts = AnalysisOptions {
+        verbose: cli.verbose,
+        rustdoc_stderr: cli.rustdoc_stderr,
+    };
+
+    let (all_seeds, mut state, local_bumps) = if let Some(direct_crates) = cli.direct {
         let seeds: HashSet<String> = direct_crates.into_iter().collect();
         println!(
             "{} assuming BREAKING change for {}\n",
             "Direct mode:".bold(),
-            format!("{:?}", seeds).cyan()
+            format_name_set(&seeds).cyan()
         );
-        (seeds, HashSet::new(), HashMap::new())
+        let wave = WaveState {
+            breaking_crates: seeds.clone(),
+            additive_crates: HashSet::new(),
+            failed: HashSet::new(),
+        };
+        (seeds, wave, HashMap::new())
     } else {
         println!(
             "Comparing versions between {} and {}...\n",
             cli.source.cyan().bold(),
             cli.target.cyan().bold()
         );
-        let (breaking_seeds, additive_seeds, local_bumps) =
-            detect_version_changes(&cli.source, &cli.target)?;
+        let changes = detect_version_changes(&cli.source, &cli.target)?;
 
-        if breaking_seeds.is_empty() && additive_seeds.is_empty() {
+        if changes.breaking_seeds.is_empty() && changes.additive_seeds.is_empty() {
             println!(
                 "{}",
                 "No breaking/additive version changes detected. Nothing to propagate.".green()
@@ -115,33 +121,37 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        if !breaking_seeds.is_empty() {
+        if !changes.breaking_seeds.is_empty() {
             println!(
                 "\n{} {}\n",
                 "Breaking seeds:".bold(),
-                format!("{:?}", breaking_seeds).red()
+                format_name_set(&changes.breaking_seeds).red()
             );
         }
-        if !additive_seeds.is_empty() {
+        if !changes.additive_seeds.is_empty() {
             println!(
                 "{} {}\n",
                 "Additive seeds:".bold(),
-                format!("{:?}", additive_seeds).yellow()
+                format_name_set(&changes.additive_seeds).yellow()
             );
         }
-        (breaking_seeds, additive_seeds, local_bumps)
+
+        let all_seeds: HashSet<String> = changes
+            .breaking_seeds
+            .iter()
+            .chain(changes.additive_seeds.iter())
+            .cloned()
+            .collect();
+
+        let wave = WaveState {
+            breaking_crates: changes.breaking_seeds,
+            additive_crates: changes.additive_seeds,
+            failed: HashSet::new(),
+        };
+        (all_seeds, wave, changes.local_bumps)
     };
 
-    let all_seeds: HashSet<String> = breaking_seeds
-        .iter()
-        .chain(additive_seeds.iter())
-        .cloned()
-        .collect();
-
-    let mut breaking_crates = breaking_seeds.clone();
-    let mut additive_crates = additive_seeds.clone();
     let mut patch_crates: HashSet<String> = HashSet::new();
-    let mut failed: HashSet<String> = HashSet::new();
     let mut tree_edges: HashMap<String, Vec<(String, Bump)>> = HashMap::new();
 
     let metadata = MetadataCommand::new()
@@ -193,7 +203,7 @@ fn main() -> Result<()> {
 
         for i in (0..pending_nodes.len()).rev() {
             let node = pending_nodes[i];
-            let node_name = ctx.pkg_names[&node.id].clone();
+            let node_name = &ctx.pkg_names[&node.id];
 
             let deps_ready = node.deps.iter().filter(|d| is_normal_dep(d)).all(|dep| {
                 if dep.pkg == node.id {
@@ -206,15 +216,8 @@ fn main() -> Result<()> {
             });
 
             if deps_ready {
-                let (change_kind, _bump, influences) = evaluate_crate_bump(
-                    node,
-                    &ctx,
-                    &breaking_crates,
-                    &additive_crates,
-                    &mut failed,
-                    cli.verbose,
-                    cli.rustdoc_stderr,
-                )?;
+                let (change_kind, _bump, influences) =
+                    evaluate_crate_bump(node, &ctx, &mut state, &opts)?;
 
                 for inf in &influences {
                     tree_edges
@@ -225,10 +228,10 @@ fn main() -> Result<()> {
 
                 match change_kind {
                     ChangeKind::Breaking => {
-                        breaking_crates.insert(node_name.clone());
+                        state.breaking_crates.insert(node_name.clone());
                     }
                     ChangeKind::Additive => {
-                        additive_crates.insert(node_name.clone());
+                        state.additive_crates.insert(node_name.clone());
                     }
                     ChangeKind::Patch => {
                         patch_crates.insert(node_name.clone());
@@ -236,82 +239,51 @@ fn main() -> Result<()> {
                     ChangeKind::None => {}
                 }
 
-                processed.insert(node_name);
+                processed.insert(node_name.clone());
                 pending_nodes.remove(i);
                 made_progress = true;
             }
         }
 
         if !made_progress {
-            let stuck: Vec<String> = pending_nodes
+            let stuck: Vec<&str> = pending_nodes
                 .iter()
-                .map(|n| ctx.pkg_names[&n.id].clone())
+                .map(|n| ctx.pkg_names[&n.id].as_str())
                 .collect();
-            let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-            for node in &pending_nodes {
-                let name = ctx.pkg_names[&node.id].as_str();
-                for dep in node.deps.iter().filter(|d| is_normal_dep(d)) {
-                    if dep.pkg == node.id {
-                        continue;
-                    }
-                    let dep_name = ctx.pkg_names[&dep.pkg].as_str();
-                    if stuck.iter().any(|s| s == dep_name) {
-                        adj.entry(name).or_default().push(dep_name);
-                    }
-                }
-            }
-            let cycle = find_cycle(&adj);
-            eprintln!(
-                "\n{} Cycle detected among unresolved crates:",
-                "ERROR:".red().bold()
+            anyhow::bail!(
+                "Cannot make progress on crates: {:?}. \
+                 This should not happen with a valid Cargo workspace.",
+                stuck
             );
-            if let Some(cycle) = cycle {
-                let path = cycle
-                    .iter()
-                    .map(|s| s.cyan().bold().to_string())
-                    .collect::<Vec<_>>()
-                    .join(&format!(" {} ", "->".red()));
-                eprintln!("  {}", path);
-            } else {
-                for name in &stuck {
-                    eprintln!("  {}", name.cyan());
-                }
-            }
-            anyhow::bail!("Cannot make progress - cycle in workspace dependencies");
         }
     }
 
-    // Remove seeds and already-bumped crates from the result sets
     for seed in &all_seeds {
-        breaking_crates.remove(seed);
-        additive_crates.remove(seed);
+        state.breaking_crates.remove(seed);
+        state.additive_crates.remove(seed);
         patch_crates.remove(seed);
     }
 
     for (name, existing_bump) in &local_bumps {
-        match *existing_bump {
-            Bump::Major => {
-                breaking_crates.remove(name);
-                additive_crates.remove(name);
-                patch_crates.remove(name);
-            }
-            Bump::Minor => {
-                additive_crates.remove(name);
-                patch_crates.remove(name);
-            }
-            Bump::Patch => {
-                patch_crates.remove(name);
-            }
-            Bump::None => {}
+        if *existing_bump >= Bump::Major {
+            state.breaking_crates.remove(name);
+            state.additive_crates.remove(name);
+            patch_crates.remove(name);
+        }
+        if *existing_bump >= Bump::Minor {
+            state.additive_crates.remove(name);
+            patch_crates.remove(name);
+        }
+        if *existing_bump >= Bump::Patch {
+            patch_crates.remove(name);
         }
     }
 
-    // Map each set to final bump based on crate version
     let mut major_list: HashSet<String> = HashSet::new();
     let mut minor_list: HashSet<String> = HashSet::new();
     let mut patch_list: HashSet<String> = patch_crates;
 
-    for name in &breaking_crates {
+    for name in &state.breaking_crates {
         let bump = ctx
             .pkg_versions
             .get(name)
@@ -327,7 +299,7 @@ fn main() -> Result<()> {
         }
     }
 
-    for name in &additive_crates {
+    for name in &state.additive_crates {
         let bump = ctx
             .pkg_versions
             .get(name)
@@ -351,33 +323,33 @@ fn main() -> Result<()> {
 
     println!("{}", "=== Analysis Complete ===".bold().green());
     println!(
-        "{} {:?}",
+        "{} {}",
         "MAJOR-bump list (Requires MAJOR bump / ↑.0.0):"
             .red()
             .bold(),
-        major_list
+        format_name_set(&major_list)
     );
     println!(
-        "{} {:?}",
+        "{} {}",
         "MINOR-bump list (Requires MINOR bump / x.↑.0):"
             .yellow()
             .bold(),
-        minor_list
+        format_name_set(&minor_list)
     );
     println!(
-        "{} {:?}",
+        "{} {}",
         "PATCH-bump list (Requires PATCH bump / x.y.↑):"
             .cyan()
             .bold(),
-        patch_list
+        format_name_set(&patch_list)
     );
 
-    if !failed.is_empty() {
+    if !state.failed.is_empty() {
         eprintln!(
             "\n{} The following crates failed rustdoc JSON generation \
-             and were conservatively assumed breaking. Verify manually:\n  {:?}",
+             and were conservatively assumed breaking. Verify manually:\n  {}",
             "WARNING:".yellow().bold(),
-            failed
+            format_name_set(&state.failed)
         );
     }
 
@@ -392,7 +364,7 @@ fn main() -> Result<()> {
 
     let under_bumped: Vec<(&String, Bump, &Bump)> = all_required
         .iter()
-        .filter(|(name, _)| !failed.contains(**name))
+        .filter(|(name, _)| !state.failed.contains(**name))
         .filter_map(|(name, required)| {
             local_bumps
                 .get(*name)
@@ -408,7 +380,7 @@ fn main() -> Result<()> {
         );
         for (name, required, local) in &under_bumped {
             eprintln!(
-                "  {} has {:?} bump but requires {:?}",
+                "  {} has {} bump but requires {}",
                 name.cyan(),
                 local,
                 required
@@ -419,7 +391,7 @@ fn main() -> Result<()> {
     if !local_bumps.is_empty() {
         let missing: Vec<(&String, &Bump)> = all_required
             .iter()
-            .filter(|(name, _)| !local_bumps.contains_key(**name) && !failed.contains(**name))
+            .filter(|(name, _)| !local_bumps.contains_key(**name) && !state.failed.contains(**name))
             .map(|(name, bump)| (*name, bump))
             .collect();
         if !missing.is_empty() {
@@ -429,7 +401,7 @@ fn main() -> Result<()> {
                 "ERROR:".red().bold()
             );
             for (name, required) in &missing {
-                eprintln!("  {} requires {:?}", name.cyan(), required);
+                eprintln!("  {} requires {}", name.cyan(), required);
             }
         }
     }

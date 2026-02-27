@@ -1,3 +1,5 @@
+use std::fmt;
+
 use semver::Version;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -8,6 +10,17 @@ pub enum Bump {
     Major,
 }
 
+impl fmt::Display for Bump {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Bump::None => f.write_str("None"),
+            Bump::Patch => f.write_str("Patch"),
+            Bump::Minor => f.write_str("Minor"),
+            Bump::Major => f.write_str("Major"),
+        }
+    }
+}
+
 /// Semantic classification of a version change, independent of the version scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangeKind {
@@ -15,6 +28,17 @@ pub enum ChangeKind {
     Patch,
     Additive,
     Breaking,
+}
+
+impl fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChangeKind::None => f.write_str("None"),
+            ChangeKind::Patch => f.write_str("Patch"),
+            ChangeKind::Additive => f.write_str("Additive"),
+            ChangeKind::Breaking => f.write_str("Breaking"),
+        }
+    }
 }
 
 /// Classify the semantic change between two versions.
@@ -61,4 +85,18 @@ pub fn required_bump(version: &Version, change: ChangeKind) -> Bump {
         ChangeKind::Patch => Bump::Patch,
         ChangeKind::None => Bump::None,
     }
+}
+
+/// Format a set of strings as `{"a", "b", "c"}` for user-facing output.
+pub fn format_name_set<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
+    let mut sorted: Vec<&str> = names.into_iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    format!(
+        "{{{}}}",
+        sorted
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }

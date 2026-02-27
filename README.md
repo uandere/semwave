@@ -299,11 +299,11 @@ No. It takes a set of already-known version changes (either from a git diff or f
 
 ### Why does it need a nightly toolchain?
 
-`semwave` analyzes rustdoc JSON, which is an unstable nightly-only output format. The nightly toolchain is only used to generate those JSON files — your actual project does not need to compile on nightly, and `semwave` never runs your tests or builds your binaries.
+`semwave` analyzes rustdoc JSON, which is an unstable nightly-only output format. The nightly toolchain is only used to generate those JSON files - your actual project does not need to compile on nightly, and `semwave` never runs your tests or builds your binaries.
 
 ### What does "leaks" mean exactly?
 
-A crate "leaks" a dependency when a type from that dependency appears in the crate's public API — in a public function signature, a public struct field, a re-export, a trait bound, an associated type, etc. If consumers of your crate can observe the dependency's types through your API, a breaking change in that dependency is also a breaking change in yours.
+A crate "leaks" a dependency when a type from that dependency appears in the crate's public API - in a public function signature, a public struct field, a re-export, a trait bound, an associated type, etc. If consumers of your crate can observe the dependency's types through your API, a breaking change in that dependency is also a breaking change in yours.
 
 ### Does `semvawe` has fasle positives / negatives?
 
@@ -311,11 +311,11 @@ It shouldn't, in theory. If it does and you can prove it - this is a bug. Please
 
 ### What happens when rustdoc fails for a crate?
 
-`semwave` assumes the worst case: it treats the crate as if it leaks all affected dependencies at their highest bump level, and prints a warning. This is conservative by design — it may lead to over-bumping, but it prevents you from accidentally under-bumping. You can pass `--rustdoc-stderr` to see the actual rustdoc errors and fix them.
+`semwave` assumes the worst case: it treats the crate as if it leaks all affected dependencies at their highest bump level, and prints a warning. This is conservative by design - it may lead to over-bumping, but it prevents you from accidentally under-bumping. You can pass `--rustdoc-stderr` to see the actual rustdoc errors and fix them.
 
 ### Can I use this in CI?
 
-Yes. Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. The `--no-color` flag makes the output easier to parse in log viewers. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own — only confirmed missing or insufficient bumps do.
+Yes. Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. The `--no-color` flag makes the output easier to parse in log viewers. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
 
 ### Does it handle workspace version inheritance?
 
