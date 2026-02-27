@@ -80,19 +80,20 @@ rustup toolchain install nightly
 ## Usage
 
 ```
-Determine semver bump requirements for workspace crates
+Determine semver bump requirements for workspace crates.
 
 Usage: semwave [OPTIONS]
 
 Options:
-      --source <SOURCE>  Source git ref to compare from (the base) [default: main]
-      --target <TARGET>  Target git ref to compare to [default: HEAD]
-      --direct <DIRECT>  Comma-separated crate names to treat as breaking-change seeds directly, skipping git-based version detection
-      --no-color             Disable colored output
-  -v, --verbose              Print which public API items cause each leak
-  -t, --tree                 Print an influence tree showing how bumps propagate
-      --rustdoc-stderr       Show cargo rustdoc stderr output (warnings, errors) during analysis
-  -h, --help                 Print help
+      --source <SOURCE>        Source git ref to compare from (the base) [default: main]
+      --target <TARGET>        Target git ref to compare to [default: HEAD]
+      --direct <DIRECT>        Comma-separated crate names to treat as breaking-change seeds directly, skipping git-based version detection
+      --no-color               Disable colored output
+  -v, --verbose                Print which public API items cause each leak
+  -t, --tree                   Print an influence tree showing how bumps propagate
+      --rustdoc-stderr         Show cargo rustdoc stderr output (warnings, errors) during analysis
+      --toolchain <TOOLCHAIN>  Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15") [default: nightly]
+  -h, --help                   Print help
 ```
 
 ## FAQ
@@ -126,7 +127,7 @@ It shouldn't, in theory. If it does and you can prove it - this is a bug. Please
 
 ### Can I use this in CI?
 
-Yes, but only experimentally (because of potential over-bumping propagation). Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. The `--no-color` flag makes the output easier to parse in log viewers. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
+Yes, but only experimentally (because of potential over-bumping propagation). Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
 
 ### Does it handle workspace version inheritance?
 
