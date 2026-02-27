@@ -100,3 +100,180 @@ pub fn format_name_set<'a>(names: impl IntoIterator<Item = &'a String>) -> Strin
             .join(", ")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use semver::Version;
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn classify_same_version_is_none() {
+        assert_eq!(
+            classify_version_change(&v("1.2.3"), &v("1.2.3")),
+            ChangeKind::None
+        );
+        assert_eq!(
+            classify_version_change(&v("0.1.0"), &v("0.1.0")),
+            ChangeKind::None
+        );
+    }
+
+    #[test]
+    fn classify_zero_minor_bump_is_breaking() {
+        assert_eq!(
+            classify_version_change(&v("0.1.0"), &v("0.2.0")),
+            ChangeKind::Breaking
+        );
+        assert_eq!(
+            classify_version_change(&v("0.5.3"), &v("0.6.0")),
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_zero_patch_bump_is_patch() {
+        assert_eq!(
+            classify_version_change(&v("0.1.0"), &v("0.1.1")),
+            ChangeKind::Patch
+        );
+    }
+
+    #[test]
+    fn classify_stable_major_bump_is_breaking() {
+        assert_eq!(
+            classify_version_change(&v("1.0.0"), &v("2.0.0")),
+            ChangeKind::Breaking
+        );
+        assert_eq!(
+            classify_version_change(&v("3.1.4"), &v("4.0.0")),
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_stable_minor_bump_is_additive() {
+        assert_eq!(
+            classify_version_change(&v("1.0.0"), &v("1.1.0")),
+            ChangeKind::Additive
+        );
+        assert_eq!(
+            classify_version_change(&v("2.3.0"), &v("2.4.0")),
+            ChangeKind::Additive
+        );
+    }
+
+    #[test]
+    fn classify_stable_patch_bump_is_patch() {
+        assert_eq!(
+            classify_version_change(&v("1.0.0"), &v("1.0.1")),
+            ChangeKind::Patch
+        );
+    }
+
+    #[test]
+    fn required_bump_breaking_on_zero_is_minor() {
+        assert_eq!(
+            required_bump(&v("0.3.0"), ChangeKind::Breaking),
+            Bump::Minor
+        );
+    }
+
+    #[test]
+    fn required_bump_breaking_on_stable_is_major() {
+        assert_eq!(
+            required_bump(&v("1.0.0"), ChangeKind::Breaking),
+            Bump::Major
+        );
+        assert_eq!(
+            required_bump(&v("2.5.1"), ChangeKind::Breaking),
+            Bump::Major
+        );
+    }
+
+    #[test]
+    fn required_bump_additive_on_zero_is_patch() {
+        assert_eq!(
+            required_bump(&v("0.1.0"), ChangeKind::Additive),
+            Bump::Patch
+        );
+    }
+
+    #[test]
+    fn required_bump_additive_on_stable_is_minor() {
+        assert_eq!(
+            required_bump(&v("1.0.0"), ChangeKind::Additive),
+            Bump::Minor
+        );
+    }
+
+    #[test]
+    fn required_bump_patch_is_always_patch() {
+        assert_eq!(required_bump(&v("0.1.0"), ChangeKind::Patch), Bump::Patch);
+        assert_eq!(required_bump(&v("1.0.0"), ChangeKind::Patch), Bump::Patch);
+    }
+
+    #[test]
+    fn required_bump_none_is_always_none() {
+        assert_eq!(required_bump(&v("0.1.0"), ChangeKind::None), Bump::None);
+        assert_eq!(required_bump(&v("1.0.0"), ChangeKind::None), Bump::None);
+    }
+
+    #[test]
+    fn format_name_set_empty() {
+        let empty: Vec<String> = vec![];
+        assert_eq!(format_name_set(&empty), "{}");
+    }
+
+    #[test]
+    fn format_name_set_single() {
+        let names = vec!["foo".to_string()];
+        assert_eq!(format_name_set(&names), "{\"foo\"}");
+    }
+
+    #[test]
+    fn format_name_set_multiple_sorted() {
+        let names = vec![
+            "charlie".to_string(),
+            "alpha".to_string(),
+            "bravo".to_string(),
+        ];
+        assert_eq!(
+            format_name_set(&names),
+            "{\"alpha\", \"bravo\", \"charlie\"}"
+        );
+    }
+
+    #[test]
+    fn bump_display() {
+        assert_eq!(Bump::None.to_string(), "None");
+        assert_eq!(Bump::Patch.to_string(), "Patch");
+        assert_eq!(Bump::Minor.to_string(), "Minor");
+        assert_eq!(Bump::Major.to_string(), "Major");
+    }
+
+    #[test]
+    fn change_kind_display() {
+        assert_eq!(ChangeKind::None.to_string(), "None");
+        assert_eq!(ChangeKind::Patch.to_string(), "Patch");
+        assert_eq!(ChangeKind::Additive.to_string(), "Additive");
+        assert_eq!(ChangeKind::Breaking.to_string(), "Breaking");
+    }
+
+    #[test]
+    fn bump_ordering() {
+        assert!(Bump::None < Bump::Patch);
+        assert!(Bump::Patch < Bump::Minor);
+        assert!(Bump::Minor < Bump::Major);
+    }
+
+    #[test]
+    fn change_kind_ordering() {
+        assert!(ChangeKind::None < ChangeKind::Patch);
+        assert!(ChangeKind::Patch < ChangeKind::Additive);
+        assert!(ChangeKind::Additive < ChangeKind::Breaking);
+    }
+}

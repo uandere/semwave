@@ -303,3 +303,192 @@ fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Versio
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_single_part() {
+        let v = normalize_version("1").unwrap();
+        assert_eq!(v, Version::parse("1.0.0").unwrap());
+    }
+
+    #[test]
+    fn normalize_two_parts() {
+        let v = normalize_version("0.30").unwrap();
+        assert_eq!(v, Version::parse("0.30.0").unwrap());
+    }
+
+    #[test]
+    fn normalize_three_parts() {
+        let v = normalize_version("1.2.3").unwrap();
+        assert_eq!(v, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn normalize_strips_caret() {
+        let v = normalize_version("^1.2").unwrap();
+        assert_eq!(v, Version::parse("1.2.0").unwrap());
+    }
+
+    #[test]
+    fn normalize_strips_tilde() {
+        let v = normalize_version("~1.2.3").unwrap();
+        assert_eq!(v, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn normalize_strips_equals() {
+        let v = normalize_version("=1.2.3").unwrap();
+        assert_eq!(v, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn normalize_complex_version_fails() {
+        assert!(normalize_version(">=1.0, <2.0").is_err());
+        assert!(normalize_version(">1.0").is_err());
+        assert!(normalize_version("<2.0").is_err());
+        assert!(normalize_version("*").is_err());
+    }
+
+    #[test]
+    fn normalize_strips_whitespace() {
+        let v = normalize_version("  1.2.3  ").unwrap();
+        assert_eq!(v, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn dep_version_string_from_plain_string() {
+        let val = toml::Value::String("0.5".to_string());
+        assert_eq!(dep_version_string(&val), Some("0.5".to_string()));
+    }
+
+    #[test]
+    fn dep_version_string_from_table_with_version() {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "version".to_string(),
+            toml::Value::String("1.2".to_string()),
+        );
+        let val = toml::Value::Table(table);
+        assert_eq!(dep_version_string(&val), Some("1.2".to_string()));
+    }
+
+    #[test]
+    fn dep_version_string_from_table_without_version() {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "path".to_string(),
+            toml::Value::String("../foo".to_string()),
+        );
+        let val = toml::Value::Table(table);
+        assert_eq!(dep_version_string(&val), None);
+    }
+
+    #[test]
+    fn dep_version_string_workspace_ref_returns_none() {
+        let mut table = toml::map::Map::new();
+        table.insert("workspace".to_string(), toml::Value::Boolean(true));
+        let val = toml::Value::Table(table);
+        assert_eq!(dep_version_string(&val), None);
+    }
+
+    #[test]
+    fn extract_dep_versions_workspace_deps() {
+        let doc: toml::Value = r#"
+            [workspace.dependencies]
+            tokio = "1.0"
+            serde = { version = "1.0.100" }
+        "#
+        .parse()
+        .unwrap();
+        let deps = extract_dep_versions(&doc);
+        assert_eq!(deps.get("tokio"), Some(&"1.0".to_string()));
+        assert_eq!(deps.get("serde"), Some(&"1.0.100".to_string()));
+    }
+
+    #[test]
+    fn extract_dep_versions_regular_deps() {
+        let doc: toml::Value = r#"
+            [dependencies]
+            anyhow = "1.0"
+            
+            [dev-dependencies]
+            insta = "1.30"
+            
+            [build-dependencies]
+            cc = "1.0"
+        "#
+        .parse()
+        .unwrap();
+        let deps = extract_dep_versions(&doc);
+        assert_eq!(deps.get("anyhow"), Some(&"1.0".to_string()));
+        assert_eq!(deps.get("insta"), Some(&"1.30".to_string()));
+        assert_eq!(deps.get("cc"), Some(&"1.0".to_string()));
+    }
+
+    #[test]
+    fn extract_dep_versions_workspace_takes_priority() {
+        let doc: toml::Value = r#"
+            [workspace.dependencies]
+            serde = "1.0.200"
+            
+            [dependencies]
+            serde = { workspace = true }
+        "#
+        .parse()
+        .unwrap();
+        let deps = extract_dep_versions(&doc);
+        assert_eq!(deps.get("serde"), Some(&"1.0.200".to_string()));
+    }
+
+    #[test]
+    fn extract_dep_versions_empty_manifest() {
+        let doc: toml::Value = r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+        "#
+        .parse()
+        .unwrap();
+        let deps = extract_dep_versions(&doc);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn extract_package_version_simple() {
+        let doc: toml::Value = r#"
+            [package]
+            name = "my-crate"
+            version = "1.2.3"
+        "#
+        .parse()
+        .unwrap();
+        let (name, version) = extract_package_version(&doc, "HEAD", "Cargo.toml").unwrap();
+        assert_eq!(name, "my-crate");
+        assert_eq!(version, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn extract_package_version_missing_package_table() {
+        let doc: toml::Value = r#"
+            [workspace]
+            members = ["crates/*"]
+        "#
+        .parse()
+        .unwrap();
+        assert!(extract_package_version(&doc, "HEAD", "Cargo.toml").is_err());
+    }
+
+    #[test]
+    fn extract_package_version_missing_name() {
+        let doc: toml::Value = r#"
+            [package]
+            version = "1.0.0"
+        "#
+        .parse()
+        .unwrap();
+        assert!(extract_package_version(&doc, "HEAD", "Cargo.toml").is_err());
+    }
+}

@@ -425,3 +425,732 @@ pub fn find_leaked_deps(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdoc_types::*;
+    use std::path::PathBuf;
+
+    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
+    fn next_id() -> Id {
+        Id(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn id(n: u32) -> Id {
+        Id(n)
+    }
+
+    fn empty_generics() -> Generics {
+        Generics {
+            params: vec![],
+            where_predicates: vec![],
+        }
+    }
+
+    fn fn_header() -> FunctionHeader {
+        FunctionHeader {
+            is_const: false,
+            is_unsafe: false,
+            is_async: false,
+            abi: Abi::Rust,
+        }
+    }
+
+    fn make_item(item_id: Id, name: Option<&str>, inner: ItemEnum) -> Item {
+        Item {
+            id: item_id,
+            crate_id: 0,
+            name: name.map(|s| s.to_string()),
+            span: None,
+            visibility: Visibility::Public,
+            docs: None,
+            links: HashMap::new(),
+            attrs: vec![],
+            deprecation: None,
+            inner,
+        }
+    }
+
+    fn make_path(path_str: &str, target_id: Id) -> rustdoc_types::Path {
+        rustdoc_types::Path {
+            path: path_str.to_string(),
+            id: target_id,
+            args: None,
+        }
+    }
+
+    fn resolved_path_type(path_str: &str, target_id: Id) -> Type {
+        Type::ResolvedPath(make_path(path_str, target_id))
+    }
+
+    fn make_crate(
+        index: HashMap<Id, Item>,
+        paths: HashMap<Id, ItemSummary>,
+        external_crates: HashMap<u32, ExternalCrate>,
+    ) -> Crate {
+        Crate {
+            root: id(0),
+            crate_version: Some("0.1.0".to_string()),
+            includes_private: false,
+            index,
+            paths,
+            external_crates,
+            target: Target {
+                triple: "x86_64-unknown-linux-gnu".to_string(),
+                target_features: vec![],
+            },
+            format_version: FORMAT_VERSION,
+        }
+    }
+
+    // --- type_display_name tests ---
+
+    #[test]
+    fn display_primitive() {
+        assert_eq!(
+            type_display_name(&Type::Primitive("u32".to_string())),
+            "u32"
+        );
+    }
+
+    #[test]
+    fn display_generic() {
+        assert_eq!(type_display_name(&Type::Generic("T".to_string())), "T");
+    }
+
+    #[test]
+    fn display_resolved_path() {
+        let ty = resolved_path_type("std::vec::Vec", next_id());
+        assert_eq!(type_display_name(&ty), "std::vec::Vec");
+    }
+
+    #[test]
+    fn display_borrowed_ref() {
+        let inner = Type::Primitive("str".to_string());
+        let ty = Type::BorrowedRef {
+            lifetime: Some("'a".to_string()),
+            is_mutable: false,
+            type_: Box::new(inner),
+        };
+        assert_eq!(type_display_name(&ty), "&str");
+    }
+
+    #[test]
+    fn display_raw_pointer() {
+        let inner = Type::Primitive("u8".to_string());
+        let ty = Type::RawPointer {
+            is_mutable: true,
+            type_: Box::new(inner),
+        };
+        assert_eq!(type_display_name(&ty), "*u8");
+    }
+
+    #[test]
+    fn display_slice() {
+        let inner = Type::Primitive("u8".to_string());
+        let ty = Type::Slice(Box::new(inner));
+        assert_eq!(type_display_name(&ty), "[u8]");
+    }
+
+    #[test]
+    fn display_tuple() {
+        let ty = Type::Tuple(vec![
+            Type::Primitive("u32".to_string()),
+            Type::Primitive("bool".to_string()),
+        ]);
+        assert_eq!(type_display_name(&ty), "(u32, bool)");
+    }
+
+    #[test]
+    fn display_empty_tuple() {
+        let ty = Type::Tuple(vec![]);
+        assert_eq!(type_display_name(&ty), "()");
+    }
+
+    // --- CollectCrateIds tests ---
+
+    #[test]
+    fn collect_ids_from_resolved_path() {
+        let ext_id = next_id();
+        let mut paths_map: PathsMap = HashMap::new();
+        paths_map.insert(
+            ext_id,
+            ItemSummary {
+                crate_id: 5,
+                path: vec!["dep_crate".to_string(), "SomeType".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let ty = resolved_path_type("dep_crate::SomeType", ext_id);
+        let mut out = CrateIdSet::new();
+        ty.collect_crate_ids(&paths_map, &mut out);
+
+        assert_eq!(out.len(), 1);
+        assert!(out.contains(&(5, "dep_crate::SomeType".to_string())));
+    }
+
+    #[test]
+    fn collect_ids_from_primitive_is_empty() {
+        let paths_map: PathsMap = HashMap::new();
+        let ty = Type::Primitive("u32".to_string());
+        let mut out = CrateIdSet::new();
+        ty.collect_crate_ids(&paths_map, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_ids_from_generic_is_empty() {
+        let paths_map: PathsMap = HashMap::new();
+        let ty = Type::Generic("T".to_string());
+        let mut out = CrateIdSet::new();
+        ty.collect_crate_ids(&paths_map, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_ids_from_borrowed_ref_delegates() {
+        let ext_id = next_id();
+        let mut paths_map: PathsMap = HashMap::new();
+        paths_map.insert(
+            ext_id,
+            ItemSummary {
+                crate_id: 3,
+                path: vec!["dep".to_string(), "Foo".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let ty = Type::BorrowedRef {
+            lifetime: None,
+            is_mutable: false,
+            type_: Box::new(resolved_path_type("dep::Foo", ext_id)),
+        };
+        let mut out = CrateIdSet::new();
+        ty.collect_crate_ids(&paths_map, &mut out);
+        assert!(out.contains(&(3, "dep::Foo".to_string())));
+    }
+
+    #[test]
+    fn collect_ids_from_tuple_collects_all() {
+        let ext1 = next_id();
+        let ext2 = next_id();
+        let mut paths_map: PathsMap = HashMap::new();
+        paths_map.insert(
+            ext1,
+            ItemSummary {
+                crate_id: 2,
+                path: vec!["a".to_string(), "A".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            ext2,
+            ItemSummary {
+                crate_id: 3,
+                path: vec!["b".to_string(), "B".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let ty = Type::Tuple(vec![
+            resolved_path_type("a::A", ext1),
+            resolved_path_type("b::B", ext2),
+        ]);
+        let mut out = CrateIdSet::new();
+        ty.collect_crate_ids(&paths_map, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&(2, "a::A".to_string())));
+        assert!(out.contains(&(3, "b::B".to_string())));
+    }
+
+    #[test]
+    fn collect_ids_from_fn_sig() {
+        let arg_id = next_id();
+        let ret_id = next_id();
+        let mut paths_map: PathsMap = HashMap::new();
+        paths_map.insert(
+            arg_id,
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["dep".to_string(), "Input".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            ret_id,
+            ItemSummary {
+                crate_id: 7,
+                path: vec!["dep".to_string(), "Output".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let sig = FunctionSignature {
+            inputs: vec![("x".to_string(), resolved_path_type("dep::Input", arg_id))],
+            output: Some(resolved_path_type("dep::Output", ret_id)),
+            is_c_variadic: false,
+        };
+        let mut out = CrateIdSet::new();
+        sig.collect_crate_ids(&paths_map, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&(7, "dep::Input".to_string())));
+        assert!(out.contains(&(7, "dep::Output".to_string())));
+    }
+
+    #[test]
+    fn collect_ids_from_item_strips_local_crate() {
+        let local_id = next_id();
+        let fn_id = next_id();
+        let mut paths_map: PathsMap = HashMap::new();
+        paths_map.insert(
+            local_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "MyType".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let item = make_item(
+            fn_id,
+            Some("my_fn"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(resolved_path_type("my_crate::MyType", local_id)),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut out = CrateIdSet::new();
+        item.collect_crate_ids(&paths_map, &mut out);
+        assert!(
+            out.is_empty(),
+            "crate_id 0 (local crate) should be filtered out"
+        );
+    }
+
+    // --- find_leaked_deps tests ---
+
+    #[test]
+    fn no_leaks_when_no_deps_tracked() {
+        let fn_id = next_id();
+        let fn_item = make_item(
+            fn_id,
+            Some("my_fn"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(Type::Primitive("u32".to_string())),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(fn_id, fn_item);
+
+        let krate = make_crate(index, HashMap::new(), HashMap::new());
+        let dep_ids: HashMap<u32, String> = HashMap::new();
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(leaked.is_empty());
+    }
+
+    #[test]
+    fn function_returning_external_type_leaks() {
+        let ext_type_id = next_id();
+        let fn_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            ext_type_id,
+            ItemSummary {
+                crate_id: 5,
+                path: vec!["ext_dep".to_string(), "Widget".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            fn_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "get_widget".to_string()],
+                kind: ItemKind::Function,
+            },
+        );
+
+        let fn_item = make_item(
+            fn_id,
+            Some("get_widget"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(resolved_path_type("ext_dep::Widget", ext_type_id)),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(fn_id, fn_item);
+
+        let mut ext_crates = HashMap::new();
+        ext_crates.insert(
+            5,
+            ExternalCrate {
+                name: "ext_dep".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+
+        let krate = make_crate(index, paths_map, ext_crates);
+        let mut dep_ids = HashMap::new();
+        dep_ids.insert(5u32, "ext_dep".to_string());
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(leaked.contains_key("ext_dep"));
+        let details = &leaked["ext_dep"];
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].item_kind, "fn");
+        assert!(details[0].leaked_types.contains("ext_dep::Widget"));
+    }
+
+    #[test]
+    fn function_with_only_local_types_no_leak() {
+        let local_type_id = next_id();
+        let fn_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            local_type_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "MyStruct".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            fn_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "get_mine".to_string()],
+                kind: ItemKind::Function,
+            },
+        );
+
+        let fn_item = make_item(
+            fn_id,
+            Some("get_mine"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(resolved_path_type("my_crate::MyStruct", local_type_id)),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(fn_id, fn_item);
+
+        let mut ext_crates = HashMap::new();
+        ext_crates.insert(
+            5,
+            ExternalCrate {
+                name: "ext_dep".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+
+        let krate = make_crate(index, paths_map, ext_crates);
+        let mut dep_ids = HashMap::new();
+        dep_ids.insert(5u32, "ext_dep".to_string());
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(
+            leaked.is_empty(),
+            "functions using only local types should not leak"
+        );
+    }
+
+    #[test]
+    fn struct_field_leaks_external_type() {
+        let ext_type_id = next_id();
+        let struct_id = next_id();
+        let field_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            ext_type_id,
+            ItemSummary {
+                crate_id: 3,
+                path: vec!["dep".to_string(), "Config".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            struct_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "MyWrapper".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let field_item = make_item(
+            field_id,
+            Some("inner"),
+            ItemEnum::StructField(resolved_path_type("dep::Config", ext_type_id)),
+        );
+
+        let struct_item = make_item(
+            struct_id,
+            Some("MyWrapper"),
+            ItemEnum::Struct(Struct {
+                generics: empty_generics(),
+                kind: StructKind::Plain {
+                    fields: vec![field_id],
+                    has_stripped_fields: false,
+                },
+                impls: vec![],
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(field_id, field_item);
+        index.insert(struct_id, struct_item);
+
+        let mut ext_crates = HashMap::new();
+        ext_crates.insert(
+            3,
+            ExternalCrate {
+                name: "dep".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+
+        let krate = make_crate(index, paths_map, ext_crates);
+        let mut dep_ids = HashMap::new();
+        dep_ids.insert(3u32, "dep".to_string());
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(leaked.contains_key("dep"));
+        let details = &leaked["dep"];
+        assert!(details.iter().any(|d| d.item_kind == "field"));
+        assert!(
+            details
+                .iter()
+                .any(|d| d.leaked_types.contains("dep::Config"))
+        );
+    }
+
+    #[test]
+    fn reexport_leaks_external_type() {
+        let ext_type_id = next_id();
+        let use_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            ext_type_id,
+            ItemSummary {
+                crate_id: 2,
+                path: vec!["foreign".to_string(), "Gadget".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+
+        let use_item = make_item(
+            use_id,
+            Some("Gadget"),
+            ItemEnum::Use(Use {
+                source: "foreign::Gadget".to_string(),
+                name: "Gadget".to_string(),
+                id: Some(ext_type_id),
+                is_glob: false,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(use_id, use_item);
+
+        let mut ext_crates = HashMap::new();
+        ext_crates.insert(
+            2,
+            ExternalCrate {
+                name: "foreign".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+
+        let krate = make_crate(index, paths_map, ext_crates);
+        let mut dep_ids = HashMap::new();
+        dep_ids.insert(2u32, "foreign".to_string());
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(leaked.contains_key("foreign"));
+        let details = &leaked["foreign"];
+        assert!(details.iter().any(|d| d.item_kind == "re-export"));
+    }
+
+    #[test]
+    fn multiple_deps_tracked_separately() {
+        let ext_a_id = next_id();
+        let ext_b_id = next_id();
+        let fn_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            ext_a_id,
+            ItemSummary {
+                crate_id: 2,
+                path: vec!["dep_a".to_string(), "TypeA".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            ext_b_id,
+            ItemSummary {
+                crate_id: 3,
+                path: vec!["dep_b".to_string(), "TypeB".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            fn_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "convert".to_string()],
+                kind: ItemKind::Function,
+            },
+        );
+
+        let fn_item = make_item(
+            fn_id,
+            Some("convert"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![(
+                        "a".to_string(),
+                        resolved_path_type("dep_a::TypeA", ext_a_id),
+                    )],
+                    output: Some(resolved_path_type("dep_b::TypeB", ext_b_id)),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(fn_id, fn_item);
+
+        let mut ext_crates = HashMap::new();
+        ext_crates.insert(
+            2,
+            ExternalCrate {
+                name: "dep_a".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+        ext_crates.insert(
+            3,
+            ExternalCrate {
+                name: "dep_b".to_string(),
+                html_root_url: None,
+                path: PathBuf::new(),
+            },
+        );
+
+        let krate = make_crate(index, paths_map, ext_crates);
+        let mut dep_ids = HashMap::new();
+        dep_ids.insert(2u32, "dep_a".to_string());
+        dep_ids.insert(3u32, "dep_b".to_string());
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(
+            leaked.contains_key("dep_a"),
+            "dep_a should be detected as leaked"
+        );
+        assert!(
+            leaked.contains_key("dep_b"),
+            "dep_b should be detected as leaked"
+        );
+
+        assert!(leaked["dep_a"][0].leaked_types.contains("dep_a::TypeA"));
+        assert!(leaked["dep_b"][0].leaked_types.contains("dep_b::TypeB"));
+    }
+
+    #[test]
+    fn untracked_dep_not_leaked() {
+        let ext_type_id = next_id();
+        let fn_id = next_id();
+
+        let mut paths_map: HashMap<Id, ItemSummary> = HashMap::new();
+        paths_map.insert(
+            ext_type_id,
+            ItemSummary {
+                crate_id: 9,
+                path: vec!["untracked".to_string(), "Thing".to_string()],
+                kind: ItemKind::Struct,
+            },
+        );
+        paths_map.insert(
+            fn_id,
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["my_crate".to_string(), "do_thing".to_string()],
+                kind: ItemKind::Function,
+            },
+        );
+
+        let fn_item = make_item(
+            fn_id,
+            Some("do_thing"),
+            ItemEnum::Function(Function {
+                sig: FunctionSignature {
+                    inputs: vec![],
+                    output: Some(resolved_path_type("untracked::Thing", ext_type_id)),
+                    is_c_variadic: false,
+                },
+                generics: empty_generics(),
+                header: fn_header(),
+                has_body: true,
+            }),
+        );
+
+        let mut index = HashMap::new();
+        index.insert(fn_id, fn_item);
+
+        let krate = make_crate(index, paths_map, HashMap::new());
+        let dep_ids: HashMap<u32, String> = HashMap::new();
+
+        let leaked = find_leaked_deps(&krate, &dep_ids);
+        assert!(
+            leaked.is_empty(),
+            "deps not in dep_crate_ids should not appear as leaked"
+        );
+    }
+}
