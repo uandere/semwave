@@ -95,7 +95,6 @@ Options:
   -h, --help                 Print help
 ```
 
-
 ## FAQ
 
 ### Why not just use `cargo-semver-checks` / `release-plz`?
