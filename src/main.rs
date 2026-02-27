@@ -78,6 +78,10 @@ struct Cli {
     /// Show cargo rustdoc stderr output (warnings, errors) during analysis
     #[arg(long)]
     rustdoc_stderr: bool,
+
+    /// Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15")
+    #[arg(long, default_value = "nightly")]
+    toolchain: String,
 }
 
 fn main() -> Result<()> {
@@ -90,6 +94,7 @@ fn main() -> Result<()> {
     let opts = AnalysisOptions {
         verbose: cli.verbose,
         rustdoc_stderr: cli.rustdoc_stderr,
+        toolchain: cli.toolchain,
     };
 
     let (all_seeds, mut state, local_bumps) = if let Some(direct_crates) = cli.direct {

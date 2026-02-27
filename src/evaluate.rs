@@ -36,6 +36,7 @@ pub struct WaveState {
 pub struct AnalysisOptions {
     pub verbose: bool,
     pub rustdoc_stderr: bool,
+    pub toolchain: String,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
@@ -107,7 +108,7 @@ pub fn evaluate_crate_bump(
         .with_context(|| format!("No manifest path for {}", node_name))?;
 
     let json_path = match rustdoc_json::Builder::default()
-        .toolchain("nightly")
+        .toolchain(&opts.toolchain)
         .manifest_path(manifest)
         .all_features(true)
         .cap_lints(Some("allow"))
