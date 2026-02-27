@@ -102,31 +102,56 @@ Options:
 **What happens if we introduce breaking changes to `pin-project-lite` in `tokio` repo?**
 
 ```
-> semwave --direct pin-project-lite --tree
+> RUSTFLAGS="--cfg tokio_unstable" RUSTDOCFLAGS="--cfg tokio_unstable" \
+    semwave --direct pin-project-lite --tree
 ```
 
-**Result:**
+**Result** (at tokio commit [`8c980ea`](https://github.com/tokio-rs/tokio/commit/8c980ea75a0f8dd2799403777db700c2e8f4cda4)):
 
 ```
 Direct mode: assuming BREAKING change for {"pin-project-lite"}
 
 Analyzing tokio for public API exposure of ["pin-project-lite"]
-Analyzing tokio-util for public API exposure of ["pin-project-lite"]
+  -> tokio leaks pin-project-lite (Major):
+Analyzing tests-build for public API exposure of ["tokio"]
+  -> tests-build leaks tokio (Minor):
+  -> stress-test is binary-only, no public API to leak
+  -> benches is binary-only, no public API to leak
+Analyzing tokio-util for public API exposure of ["pin-project-lite", "tokio"]
   -> tokio-util leaks pin-project-lite (Minor):
-Analyzing tokio-stream for public API exposure of ["pin-project-lite"]
+  -> tokio-util leaks tokio (Minor):
+Analyzing tokio-test for public API exposure of ["tokio"]
+  -> tokio-test leaks tokio (Minor):
+Analyzing tokio-stream for public API exposure of ["pin-project-lite", "tokio", "tokio-util"]
   -> tokio-stream leaks pin-project-lite (Minor):
+  -> tokio-stream leaks tokio (Minor):
+Analyzing tests-integration for public API exposure of ["tokio", "tokio-test"]
 
 === Influence Tree ===
 └── pin-project-lite (seed)
-    ├── tokio  (PATCH)
-    ├── tokio-stream  (MINOR)
-    └── tokio-util  (MINOR)
+    ├── tokio  (MAJOR)
+    │   ├── benches  (PATCH)
+    │   ├── stress-test  (PATCH)
+    │   ├── tests-build  (MINOR)
+    │   ├── tests-integration  (PATCH)
+    │   ├── tokio-stream  (MINOR)
+    │   ├── tokio-test  (MINOR)
+    │   │   └── tests-integration (PATCH, already shown above)
+    │   └── tokio-util  (MINOR)
+    │       └── tokio-stream (PATCH, already shown above)
+    ├── tokio-stream (MINOR, already shown above)
+    └── tokio-util (MINOR, already shown above)
 
 === Analysis Complete ===
-MAJOR-bump list (Requires MAJOR bump / ↑.0.0): {}
-MINOR-bump list (Requires MINOR bump / x.↑.0): {"tokio-stream", "tokio-util"}
-PATCH-bump list (Requires PATCH bump / x.y.↑): {"tokio"}
+MAJOR-bump list (Requires MAJOR bump / ↑.0.0): {"tokio"}
+MINOR-bump list (Requires MINOR bump / x.↑.0): {"tests-build", "tokio-stream", "tokio-test", "tokio-util"}
+PATCH-bump list (Requires PATCH bump / x.y.↑): {"benches", "stress-test", "tests-integration"}
 ```
+
+> **Note:** tokio uses a custom `--cfg tokio_unstable` flag that gates parts of its API.
+> Passing `RUSTFLAGS` and `RUSTDOCFLAGS` ensures rustdoc can compile the full API surface.
+> Without these flags, `semwave` still works but conservatively assumes a MAJOR bump for
+> tokio and prints a warning.
 
 ### 2
 
