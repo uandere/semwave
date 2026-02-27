@@ -29,8 +29,6 @@
 pub mod display;
 /// Bump evaluation
 pub mod evaluate;
-/// Cycle detection (DFS-based)
-pub mod graph;
 /// Leak handling
 pub mod leak;
 /// Seed detection & management
@@ -45,8 +43,7 @@ use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 
 use crate::display::print_influence_tree;
-use crate::evaluate::{WorkspaceContext, evaluate_crate_bump};
-use crate::graph::{find_cycle, is_normal_dep};
+use crate::evaluate::{WorkspaceContext, evaluate_crate_bump, is_normal_dep};
 use crate::seeds::detect_version_changes;
 use crate::semver::{Bump, ChangeKind, required_bump};
 
@@ -247,37 +244,11 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|n| ctx.pkg_names[&n.id].clone())
                 .collect();
-            let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-            for node in &pending_nodes {
-                let name = ctx.pkg_names[&node.id].as_str();
-                for dep in node.deps.iter().filter(|d| is_normal_dep(d)) {
-                    if dep.pkg == node.id {
-                        continue;
-                    }
-                    let dep_name = ctx.pkg_names[&dep.pkg].as_str();
-                    if stuck.iter().any(|s| s == dep_name) {
-                        adj.entry(name).or_default().push(dep_name);
-                    }
-                }
-            }
-            let cycle = find_cycle(&adj);
-            eprintln!(
-                "\n{} Cycle detected among unresolved crates:",
-                "ERROR:".red().bold()
+            anyhow::bail!(
+                "Cannot make progress on crates: {:?}. \
+                 This should not happen with a valid Cargo workspace.",
+                stuck
             );
-            if let Some(cycle) = cycle {
-                let path = cycle
-                    .iter()
-                    .map(|s| s.cyan().bold().to_string())
-                    .collect::<Vec<_>>()
-                    .join(&format!(" {} ", "->".red()));
-                eprintln!("  {}", path);
-            } else {
-                for name in &stuck {
-                    eprintln!("  {}", name.cyan());
-                }
-            }
-            anyhow::bail!("Cannot make progress - cycle in workspace dependencies");
         }
     }
 

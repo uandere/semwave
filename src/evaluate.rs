@@ -1,14 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    is_normal_dep,
     leak::find_leaked_deps,
     semver::{Bump, ChangeKind, required_bump},
 };
 use anyhow::{Context, Result};
-use cargo_metadata::{Node, PackageId};
+use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
 use colored::Colorize as _;
 use semver::Version;
+
+/// Returns true if this dependency edge includes a Normal (non-dev, non-build)
+/// dependency kind. Only normal deps affect the public API and semver surface.
+pub fn is_normal_dep(dep: &NodeDep) -> bool {
+    dep.dep_kinds
+        .iter()
+        .any(|dk| dk.kind == DependencyKind::Normal)
+}
 
 /// Shared read-only context passed to `evaluate_crate_bump` to avoid too many arguments.
 pub struct WorkspaceContext {

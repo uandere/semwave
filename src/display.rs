@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use colored::Colorize as _;
+use rustdoc_types::{GenericBound, ItemEnum, Type};
 
 use crate::semver::Bump;
 
@@ -81,5 +82,67 @@ pub fn print_tree_children(
 
         let next_prefix = format!("{}{}", prefix, child_prefix);
         print_tree_children(child, tree_edges, &next_prefix, visited);
+    }
+}
+
+pub fn item_kind_label(item: &rustdoc_types::Item) -> &'static str {
+    match &item.inner {
+        ItemEnum::Use(_) => "re-export",
+        ItemEnum::Function(_) => "fn",
+        ItemEnum::Struct(_) => "struct",
+        ItemEnum::StructField(_) => "field",
+        ItemEnum::Enum(_) => "enum",
+        ItemEnum::Variant(_) => "variant",
+        ItemEnum::Union(_) => "union",
+        ItemEnum::TypeAlias(_) => "type",
+        ItemEnum::Trait(_) => "trait",
+        ItemEnum::TraitAlias(_) => "trait alias",
+        ItemEnum::Impl(_) => "impl",
+        ItemEnum::Constant { .. } => "const",
+        ItemEnum::Static(_) => "static",
+        ItemEnum::AssocConst { .. } => "assoc const",
+        ItemEnum::AssocType { .. } => "assoc type",
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => "macro",
+        _ => "item",
+    }
+}
+
+pub fn type_display_name(ty: &Type) -> String {
+    match ty {
+        Type::ResolvedPath(p) => p.path.clone(),
+        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_)),
+        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_)),
+        Type::Slice(inner) => format!("[{}]", type_display_name(inner)),
+        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_)),
+        Type::Tuple(types) => {
+            let inner: Vec<_> = types.iter().map(type_display_name).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Generic(name) => name.clone(),
+        Type::Primitive(name) => name.clone(),
+        Type::QualifiedPath {
+            name, self_type, ..
+        } => {
+            format!("<{}>::{}", type_display_name(self_type), name)
+        }
+        Type::DynTrait(dt) => dt
+            .traits
+            .first()
+            .map(|p| format!("dyn {}", p.trait_.path))
+            .unwrap_or_else(|| "dyn ...".to_string()),
+        Type::ImplTrait(bounds) => {
+            let names: Vec<_> = bounds
+                .iter()
+                .filter_map(|b| {
+                    if let GenericBound::TraitBound { trait_, .. } = b {
+                        Some(trait_.path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            format!("impl {}", names.join(" + "))
+        }
+        _ => "_".to_string(),
     }
 }

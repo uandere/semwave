@@ -5,11 +5,254 @@ use rustdoc_types::{
     Type, VariantKind, WherePredicate,
 };
 
+use crate::display::{item_kind_label, type_display_name};
+
+type PathsMap = HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>;
+type CrateIdSet = HashSet<(u32, String)>;
+
 /// One public API item that leaks an external dependency.
 pub struct LeakDetail {
     pub item_name: String,
     pub item_kind: &'static str,
     pub leaked_types: BTreeSet<String>,
+}
+
+/// Recursively collect external crate IDs (with their fully qualified type
+/// paths) that are referenced by a rustdoc JSON node.
+trait CollectCrateIds {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet);
+}
+
+impl CollectCrateIds for Type {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        match self {
+            Type::ResolvedPath(path) => path.collect_crate_ids(paths, out),
+            Type::DynTrait(dyn_trait) => {
+                for poly in &dyn_trait.traits {
+                    poly.trait_.collect_crate_ids(paths, out);
+                }
+            }
+            Type::FunctionPointer(fp) => fp.sig.collect_crate_ids(paths, out),
+            Type::Tuple(types) => {
+                for t in types {
+                    t.collect_crate_ids(paths, out);
+                }
+            }
+            Type::Slice(inner)
+            | Type::Array { type_: inner, .. }
+            | Type::Pat { type_: inner, .. }
+            | Type::RawPointer { type_: inner, .. }
+            | Type::BorrowedRef { type_: inner, .. } => {
+                inner.collect_crate_ids(paths, out);
+            }
+            Type::ImplTrait(bounds) => {
+                for bound in bounds {
+                    bound.collect_crate_ids(paths, out);
+                }
+            }
+            Type::QualifiedPath {
+                self_type,
+                trait_,
+                args,
+                ..
+            } => {
+                self_type.collect_crate_ids(paths, out);
+                if let Some(trait_path) = trait_ {
+                    trait_path.collect_crate_ids(paths, out);
+                }
+                if let Some(ga) = args {
+                    ga.collect_crate_ids(paths, out);
+                }
+            }
+            Type::Generic(_) | Type::Primitive(_) | Type::Infer => {}
+        }
+    }
+}
+
+impl CollectCrateIds for rustdoc_types::Path {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        if let Some(summary) = paths.get(&self.id) {
+            out.insert((summary.crate_id, summary.path.join("::")));
+        }
+        if let Some(ref args) = self.args {
+            args.collect_crate_ids(paths, out);
+        }
+    }
+}
+
+impl CollectCrateIds for GenericArgs {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        match self {
+            GenericArgs::AngleBracketed { args, constraints } => {
+                for arg in args {
+                    if let GenericArg::Type(ty) = arg {
+                        ty.collect_crate_ids(paths, out);
+                    }
+                }
+                for constraint in constraints {
+                    match &constraint.binding {
+                        AssocItemConstraintKind::Equality(term) => {
+                            if let Term::Type(ty) = term {
+                                ty.collect_crate_ids(paths, out);
+                            }
+                        }
+                        AssocItemConstraintKind::Constraint(bounds) => {
+                            for bound in bounds {
+                                bound.collect_crate_ids(paths, out);
+                            }
+                        }
+                    }
+                }
+            }
+            GenericArgs::Parenthesized { inputs, output } => {
+                for ty in inputs {
+                    ty.collect_crate_ids(paths, out);
+                }
+                if let Some(ty) = output {
+                    ty.collect_crate_ids(paths, out);
+                }
+            }
+            GenericArgs::ReturnTypeNotation => {}
+        }
+    }
+}
+
+impl CollectCrateIds for GenericBound {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        if let GenericBound::TraitBound { trait_, .. } = self {
+            trait_.collect_crate_ids(paths, out);
+        }
+    }
+}
+
+impl CollectCrateIds for rustdoc_types::Generics {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        for param in &self.params {
+            if let rustdoc_types::GenericParamDefKind::Type {
+                bounds, default, ..
+            } = &param.kind
+            {
+                for bound in bounds {
+                    bound.collect_crate_ids(paths, out);
+                }
+                if let Some(ty) = default {
+                    ty.collect_crate_ids(paths, out);
+                }
+            }
+        }
+        for pred in &self.where_predicates {
+            match pred {
+                WherePredicate::BoundPredicate { type_, bounds, .. } => {
+                    type_.collect_crate_ids(paths, out);
+                    for bound in bounds {
+                        bound.collect_crate_ids(paths, out);
+                    }
+                }
+                WherePredicate::EqPredicate { lhs, rhs } => {
+                    lhs.collect_crate_ids(paths, out);
+                    if let Term::Type(ty) = rhs {
+                        ty.collect_crate_ids(paths, out);
+                    }
+                }
+                WherePredicate::LifetimePredicate { .. } => {}
+            }
+        }
+    }
+}
+
+impl CollectCrateIds for rustdoc_types::FunctionSignature {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        for (_, ty) in &self.inputs {
+            ty.collect_crate_ids(paths, out);
+        }
+        if let Some(ref ret) = self.output {
+            ret.collect_crate_ids(paths, out);
+        }
+    }
+}
+
+impl CollectCrateIds for rustdoc_types::Item {
+    fn collect_crate_ids(&self, paths: &PathsMap, out: &mut CrateIdSet) {
+        match &self.inner {
+            ItemEnum::Use(use_) => {
+                if let Some(ref target_id) = use_.id
+                    && let Some(summary) = paths.get(target_id)
+                {
+                    out.insert((summary.crate_id, summary.path.join("::")));
+                }
+            }
+            ItemEnum::Function(f) => {
+                f.sig.collect_crate_ids(paths, out);
+                f.generics.collect_crate_ids(paths, out);
+            }
+            ItemEnum::Struct(s) => {
+                s.generics.collect_crate_ids(paths, out);
+            }
+            ItemEnum::StructField(ty) => {
+                ty.collect_crate_ids(paths, out);
+            }
+            ItemEnum::Enum(e) => {
+                e.generics.collect_crate_ids(paths, out);
+            }
+            ItemEnum::Variant(_) => {}
+            ItemEnum::Union(u) => {
+                u.generics.collect_crate_ids(paths, out);
+            }
+            ItemEnum::TypeAlias(ta) => {
+                ta.type_.collect_crate_ids(paths, out);
+                ta.generics.collect_crate_ids(paths, out);
+            }
+            ItemEnum::Trait(t) => {
+                t.generics.collect_crate_ids(paths, out);
+                for bound in &t.bounds {
+                    bound.collect_crate_ids(paths, out);
+                }
+            }
+            ItemEnum::TraitAlias(ta) => {
+                ta.generics.collect_crate_ids(paths, out);
+                for bound in &ta.params {
+                    bound.collect_crate_ids(paths, out);
+                }
+            }
+            ItemEnum::Impl(imp) => {
+                imp.generics.collect_crate_ids(paths, out);
+                imp.for_.collect_crate_ids(paths, out);
+                if let Some(ref trait_path) = imp.trait_ {
+                    trait_path.collect_crate_ids(paths, out);
+                }
+            }
+            ItemEnum::Constant { type_, .. } => {
+                type_.collect_crate_ids(paths, out);
+            }
+            ItemEnum::Static(s) => {
+                s.type_.collect_crate_ids(paths, out);
+            }
+            ItemEnum::AssocConst { type_, .. } => {
+                type_.collect_crate_ids(paths, out);
+            }
+            ItemEnum::AssocType {
+                generics,
+                bounds,
+                type_,
+            } => {
+                generics.collect_crate_ids(paths, out);
+                for bound in bounds {
+                    bound.collect_crate_ids(paths, out);
+                }
+                if let Some(ty) = type_ {
+                    ty.collect_crate_ids(paths, out);
+                }
+            }
+            ItemEnum::Module(_)
+            | ItemEnum::ExternCrate { .. }
+            | ItemEnum::ExternType
+            | ItemEnum::Macro(_)
+            | ItemEnum::ProcMacro(_)
+            | ItemEnum::Primitive(_) => {}
+        }
+
+        out.retain(|(id, _)| *id != 0);
+    }
 }
 
 pub fn find_leaked_deps(
@@ -60,7 +303,8 @@ pub fn find_leaked_deps(
     let mut result: HashMap<String, Vec<LeakDetail>> = HashMap::new();
 
     for (id, item) in &krate.index {
-        let refs = collect_crate_ids_from_item(item, krate);
+        let mut refs = CrateIdSet::new();
+        item.collect_crate_ids(&krate.paths, &mut refs);
         if refs.is_empty() {
             continue;
         }
@@ -117,339 +361,4 @@ pub fn find_leaked_deps(
     }
 
     result
-}
-
-/// Collect all external crate IDs (with type paths) referenced by a single item.
-pub fn collect_crate_ids_from_item(
-    item: &rustdoc_types::Item,
-    krate: &rustdoc_types::Crate,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-
-    match &item.inner {
-        ItemEnum::Use(use_) => {
-            if let Some(ref target_id) = use_.id
-                && let Some(summary) = krate.paths.get(target_id)
-            {
-                ids.insert((summary.crate_id, summary.path.join("::")));
-            }
-        }
-        ItemEnum::Function(f) => {
-            ids.extend(collect_crate_ids_from_fn_sig(&f.sig, &krate.paths));
-            ids.extend(collect_crate_ids_from_generics(&f.generics, &krate.paths));
-        }
-        ItemEnum::Struct(s) => {
-            ids.extend(collect_crate_ids_from_generics(&s.generics, &krate.paths));
-        }
-        ItemEnum::StructField(ty) => {
-            ids.extend(collect_crate_ids_from_type(ty, &krate.paths));
-        }
-        ItemEnum::Enum(e) => {
-            ids.extend(collect_crate_ids_from_generics(&e.generics, &krate.paths));
-        }
-        ItemEnum::Variant(_) => {}
-        ItemEnum::Union(u) => {
-            ids.extend(collect_crate_ids_from_generics(&u.generics, &krate.paths));
-        }
-        ItemEnum::TypeAlias(ta) => {
-            ids.extend(collect_crate_ids_from_type(&ta.type_, &krate.paths));
-            ids.extend(collect_crate_ids_from_generics(&ta.generics, &krate.paths));
-        }
-        ItemEnum::Trait(t) => {
-            ids.extend(collect_crate_ids_from_generics(&t.generics, &krate.paths));
-            for bound in &t.bounds {
-                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
-            }
-        }
-        ItemEnum::TraitAlias(ta) => {
-            ids.extend(collect_crate_ids_from_generics(&ta.generics, &krate.paths));
-            for bound in &ta.params {
-                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
-            }
-        }
-        ItemEnum::Impl(imp) => {
-            ids.extend(collect_crate_ids_from_generics(&imp.generics, &krate.paths));
-            ids.extend(collect_crate_ids_from_type(&imp.for_, &krate.paths));
-            if let Some(ref trait_path) = imp.trait_ {
-                ids.extend(collect_crate_ids_from_path(trait_path, &krate.paths));
-            }
-        }
-        ItemEnum::Constant { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, &krate.paths));
-        }
-        ItemEnum::Static(s) => {
-            ids.extend(collect_crate_ids_from_type(&s.type_, &krate.paths));
-        }
-        ItemEnum::AssocConst { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, &krate.paths));
-        }
-        ItemEnum::AssocType {
-            generics,
-            bounds,
-            type_,
-        } => {
-            ids.extend(collect_crate_ids_from_generics(generics, &krate.paths));
-            for bound in bounds {
-                ids.extend(collect_crate_ids_from_bound(bound, &krate.paths));
-            }
-            if let Some(ty) = type_ {
-                ids.extend(collect_crate_ids_from_type(ty, &krate.paths));
-            }
-        }
-        ItemEnum::Module(_)
-        | ItemEnum::ExternCrate { .. }
-        | ItemEnum::ExternType
-        | ItemEnum::Macro(_)
-        | ItemEnum::ProcMacro(_)
-        | ItemEnum::Primitive(_) => {}
-    }
-
-    ids.retain(|(id, _)| *id != 0);
-    ids
-}
-
-pub fn collect_crate_ids_from_fn_sig(
-    sig: &rustdoc_types::FunctionSignature,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    for (_, ty) in &sig.inputs {
-        ids.extend(collect_crate_ids_from_type(ty, paths));
-    }
-    if let Some(ref out) = sig.output {
-        ids.extend(collect_crate_ids_from_type(out, paths));
-    }
-    ids
-}
-
-pub fn collect_crate_ids_from_type(
-    ty: &Type,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    match ty {
-        Type::ResolvedPath(path) => {
-            ids.extend(collect_crate_ids_from_path(path, paths));
-        }
-        Type::DynTrait(dyn_trait) => {
-            for poly in &dyn_trait.traits {
-                ids.extend(collect_crate_ids_from_path(&poly.trait_, paths));
-            }
-        }
-        Type::FunctionPointer(fp) => {
-            ids.extend(collect_crate_ids_from_fn_sig(&fp.sig, paths));
-        }
-        Type::Tuple(types) => {
-            for t in types {
-                ids.extend(collect_crate_ids_from_type(t, paths));
-            }
-        }
-        Type::Slice(inner) => {
-            ids.extend(collect_crate_ids_from_type(inner, paths));
-        }
-        Type::Array { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, paths));
-        }
-        Type::Pat { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, paths));
-        }
-        Type::ImplTrait(bounds) => {
-            for bound in bounds {
-                ids.extend(collect_crate_ids_from_bound(bound, paths));
-            }
-        }
-        Type::RawPointer { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, paths));
-        }
-        Type::BorrowedRef { type_, .. } => {
-            ids.extend(collect_crate_ids_from_type(type_, paths));
-        }
-        Type::QualifiedPath {
-            self_type,
-            trait_,
-            args,
-            ..
-        } => {
-            ids.extend(collect_crate_ids_from_type(self_type, paths));
-            if let Some(trait_path) = trait_ {
-                ids.extend(collect_crate_ids_from_path(trait_path, paths));
-            }
-            if let Some(ga) = args {
-                ids.extend(collect_crate_ids_from_generic_args(ga, paths));
-            }
-        }
-        Type::Generic(_) | Type::Primitive(_) | Type::Infer => {}
-    }
-    ids
-}
-
-pub fn collect_crate_ids_from_path(
-    path: &rustdoc_types::Path,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    if let Some(summary) = paths.get(&path.id) {
-        ids.insert((summary.crate_id, summary.path.join("::")));
-    }
-    if let Some(ref args) = path.args {
-        ids.extend(collect_crate_ids_from_generic_args(args, paths));
-    }
-    ids
-}
-
-pub fn collect_crate_ids_from_generic_args(
-    args: &GenericArgs,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    match args {
-        GenericArgs::AngleBracketed { args, constraints } => {
-            for arg in args {
-                match arg {
-                    GenericArg::Type(ty) => {
-                        ids.extend(collect_crate_ids_from_type(ty, paths));
-                    }
-                    GenericArg::Lifetime(_) | GenericArg::Const(_) | GenericArg::Infer => {}
-                }
-            }
-            for constraint in constraints {
-                match &constraint.binding {
-                    AssocItemConstraintKind::Equality(term) => {
-                        if let Term::Type(ty) = term {
-                            ids.extend(collect_crate_ids_from_type(ty, paths));
-                        }
-                    }
-                    AssocItemConstraintKind::Constraint(bounds) => {
-                        for bound in bounds {
-                            ids.extend(collect_crate_ids_from_bound(bound, paths));
-                        }
-                    }
-                }
-            }
-        }
-        GenericArgs::Parenthesized { inputs, output } => {
-            for ty in inputs {
-                ids.extend(collect_crate_ids_from_type(ty, paths));
-            }
-            if let Some(ty) = output {
-                ids.extend(collect_crate_ids_from_type(ty, paths));
-            }
-        }
-        GenericArgs::ReturnTypeNotation => {}
-    }
-    ids
-}
-
-pub fn collect_crate_ids_from_bound(
-    bound: &GenericBound,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    if let GenericBound::TraitBound { trait_, .. } = bound {
-        ids.extend(collect_crate_ids_from_path(trait_, paths));
-    }
-    ids
-}
-
-pub fn collect_crate_ids_from_generics(
-    generics: &rustdoc_types::Generics,
-    paths: &HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>,
-) -> HashSet<(u32, String)> {
-    let mut ids = HashSet::new();
-    for param in &generics.params {
-        if let rustdoc_types::GenericParamDefKind::Type {
-            bounds, default, ..
-        } = &param.kind
-        {
-            for bound in bounds {
-                ids.extend(collect_crate_ids_from_bound(bound, paths));
-            }
-            if let Some(ty) = default {
-                ids.extend(collect_crate_ids_from_type(ty, paths));
-            }
-        }
-    }
-    for pred in &generics.where_predicates {
-        match pred {
-            WherePredicate::BoundPredicate { type_, bounds, .. } => {
-                ids.extend(collect_crate_ids_from_type(type_, paths));
-                for bound in bounds {
-                    ids.extend(collect_crate_ids_from_bound(bound, paths));
-                }
-            }
-            WherePredicate::EqPredicate { lhs, rhs } => {
-                ids.extend(collect_crate_ids_from_type(lhs, paths));
-                if let Term::Type(ty) = rhs {
-                    ids.extend(collect_crate_ids_from_type(ty, paths));
-                }
-            }
-            WherePredicate::LifetimePredicate { .. } => {}
-        }
-    }
-    ids
-}
-
-/// Walk the entire rustdoc JSON index and find which target deps are leaked
-/// in the public API. Returns a map from dep name to the list of item names
-/// that expose it.
-fn item_kind_label(item: &rustdoc_types::Item) -> &'static str {
-    match &item.inner {
-        ItemEnum::Use(_) => "re-export",
-        ItemEnum::Function(_) => "fn",
-        ItemEnum::Struct(_) => "struct",
-        ItemEnum::StructField(_) => "field",
-        ItemEnum::Enum(_) => "enum",
-        ItemEnum::Variant(_) => "variant",
-        ItemEnum::Union(_) => "union",
-        ItemEnum::TypeAlias(_) => "type",
-        ItemEnum::Trait(_) => "trait",
-        ItemEnum::TraitAlias(_) => "trait alias",
-        ItemEnum::Impl(_) => "impl",
-        ItemEnum::Constant { .. } => "const",
-        ItemEnum::Static(_) => "static",
-        ItemEnum::AssocConst { .. } => "assoc const",
-        ItemEnum::AssocType { .. } => "assoc type",
-        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => "macro",
-        _ => "item",
-    }
-}
-
-pub fn type_display_name(ty: &Type) -> String {
-    match ty {
-        Type::ResolvedPath(p) => p.path.clone(),
-        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_)),
-        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_)),
-        Type::Slice(inner) => format!("[{}]", type_display_name(inner)),
-        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_)),
-        Type::Tuple(types) => {
-            let inner: Vec<_> = types.iter().map(type_display_name).collect();
-            format!("({})", inner.join(", "))
-        }
-        Type::Generic(name) => name.clone(),
-        Type::Primitive(name) => name.clone(),
-        Type::QualifiedPath {
-            name, self_type, ..
-        } => {
-            format!("<{}>::{}", type_display_name(self_type), name)
-        }
-        Type::DynTrait(dt) => dt
-            .traits
-            .first()
-            .map(|p| format!("dyn {}", p.trait_.path))
-            .unwrap_or_else(|| "dyn ...".to_string()),
-        Type::ImplTrait(bounds) => {
-            let names: Vec<_> = bounds
-                .iter()
-                .filter_map(|b| {
-                    if let GenericBound::TraitBound { trait_, .. } = b {
-                        Some(trait_.path.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            format!("impl {}", names.join(" + "))
-        }
-        _ => "_".to_string(),
-    }
 }
