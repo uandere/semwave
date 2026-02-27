@@ -340,7 +340,7 @@ It shouldn't, in theory. If it does and you can prove it - this is a bug. Please
 
 ### Can I use this in CI?
 
-Yes. Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. The `--no-color` flag makes the output easier to parse in log viewers. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
+Yes, but only experimentally (because of potential over-bumping propagation). Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. The `--no-color` flag makes the output easier to parse in log viewers. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
 
 ### Does it handle workspace version inheritance?
 
