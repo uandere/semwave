@@ -10,8 +10,12 @@ use semver::Version;
 
 use crate::semver::{Bump, ChangeKind, classify_version_change, required_bump};
 
-/// Return type for `detect_version_changes`: (breaking_seeds, additive_seeds, local_bumps).
-pub type VersionChanges = (HashSet<String>, HashSet<String>, HashMap<String, Bump>);
+/// Result of scanning git diffs for version changes.
+pub struct VersionChanges {
+    pub breaking_seeds: HashSet<String>,
+    pub additive_seeds: HashSet<String>,
+    pub local_bumps: HashMap<String, Bump>,
+}
 
 pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChanges> {
     let changed_files = get_changed_cargo_tomls(source, target)?;
@@ -127,10 +131,14 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
         }
     }
 
-    Ok((breaking_seeds, additive_seeds, local_bumps))
+    Ok(VersionChanges {
+        breaking_seeds,
+        additive_seeds,
+        local_bumps,
+    })
 }
 
-pub fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>> {
+fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>> {
     let diff_range = format!("{}..{}", source, target);
     let output = Command::new("git")
         .args(["diff", "--name-only", &diff_range])
@@ -149,11 +157,7 @@ pub fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>
         .collect())
 }
 
-/// Extract all dependency name -> version mappings from a parsed Cargo.toml.
-/// Covers \[workspace.dependencies\], \[dependencies\], \[dev-dependencies\],
-/// and \[build-dependencies\]. Entries using `workspace = true` (no explicit
-/// version) are skipped -- their versions come from the workspace root.
-pub fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
+fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
     let mut versions = HashMap::new();
 
     if let Some(ws_deps) = doc
@@ -181,9 +185,7 @@ pub fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
     versions
 }
 
-/// Extract the version string from a dependency value.
-/// Returns None for workspace references or entries without an explicit version.
-pub fn dep_version_string(value: &toml::Value) -> Option<String> {
+fn dep_version_string(value: &toml::Value) -> Option<String> {
     match value {
         toml::Value::String(s) => Some(s.clone()),
         toml::Value::Table(t) => t
@@ -194,9 +196,7 @@ pub fn dep_version_string(value: &toml::Value) -> Option<String> {
     }
 }
 
-/// Normalize a Cargo version requirement string to a proper semver Version.
-/// Handles short forms like "0.30" -> "0.30.0" and common prefixes.
-pub fn normalize_version(ver_str: &str) -> Result<Version> {
+fn normalize_version(ver_str: &str) -> Result<Version> {
     let ver = ver_str
         .trim()
         .trim_start_matches('^')
@@ -233,8 +233,6 @@ fn read_toml_at_ref(git_ref: &str, file_path: &str) -> Result<toml::Value> {
         .with_context(|| format!("Failed to parse {} at {}", file_path, git_ref))
 }
 
-/// Extract package name and version from an already-parsed Cargo.toml.
-/// Resolves `version.workspace = true` by walking up to the workspace root.
 fn extract_package_version(
     doc: &toml::Value,
     git_ref: &str,
@@ -266,8 +264,6 @@ fn extract_package_version(
     Ok((name, version))
 }
 
-/// Walk parent directories to find the nearest \[workspace\] manifest and
-/// return its \[workspace.package\].version.
 fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Version> {
     let mut dir = Path::new(crate_toml_path)
         .parent()

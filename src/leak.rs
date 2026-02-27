@@ -5,8 +5,6 @@ use rustdoc_types::{
     Type, VariantKind, WherePredicate,
 };
 
-use crate::display::{item_kind_label, type_display_name};
-
 type PathsMap = HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>;
 type CrateIdSet = HashSet<(u32, String)>;
 
@@ -15,6 +13,68 @@ pub struct LeakDetail {
     pub item_name: String,
     pub item_kind: &'static str,
     pub leaked_types: BTreeSet<String>,
+}
+
+fn item_kind_label(item: &rustdoc_types::Item) -> &'static str {
+    match &item.inner {
+        ItemEnum::Use(_) => "re-export",
+        ItemEnum::Function(_) => "fn",
+        ItemEnum::Struct(_) => "struct",
+        ItemEnum::StructField(_) => "field",
+        ItemEnum::Enum(_) => "enum",
+        ItemEnum::Variant(_) => "variant",
+        ItemEnum::Union(_) => "union",
+        ItemEnum::TypeAlias(_) => "type",
+        ItemEnum::Trait(_) => "trait",
+        ItemEnum::TraitAlias(_) => "trait alias",
+        ItemEnum::Impl(_) => "impl",
+        ItemEnum::Constant { .. } => "const",
+        ItemEnum::Static(_) => "static",
+        ItemEnum::AssocConst { .. } => "assoc const",
+        ItemEnum::AssocType { .. } => "assoc type",
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => "macro",
+        _ => "item",
+    }
+}
+
+fn type_display_name(ty: &Type) -> String {
+    match ty {
+        Type::ResolvedPath(p) => p.path.clone(),
+        Type::BorrowedRef { type_, .. } => format!("&{}", type_display_name(type_)),
+        Type::RawPointer { type_, .. } => format!("*{}", type_display_name(type_)),
+        Type::Slice(inner) => format!("[{}]", type_display_name(inner)),
+        Type::Array { type_, .. } => format!("[{}; _]", type_display_name(type_)),
+        Type::Tuple(types) => {
+            let inner: Vec<_> = types.iter().map(type_display_name).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Generic(name) => name.clone(),
+        Type::Primitive(name) => name.clone(),
+        Type::QualifiedPath {
+            name, self_type, ..
+        } => {
+            format!("<{}>::{}", type_display_name(self_type), name)
+        }
+        Type::DynTrait(dt) => dt
+            .traits
+            .first()
+            .map(|p| format!("dyn {}", p.trait_.path))
+            .unwrap_or_else(|| "dyn ...".to_string()),
+        Type::ImplTrait(bounds) => {
+            let names: Vec<_> = bounds
+                .iter()
+                .filter_map(|b| {
+                    if let GenericBound::TraitBound { trait_, .. } = b {
+                        Some(trait_.path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            format!("impl {}", names.join(" + "))
+        }
+        _ => "_".to_string(),
+    }
 }
 
 /// Recursively collect external crate IDs (with their fully qualified type
@@ -337,22 +397,25 @@ pub fn find_leaked_deps(
             .unwrap_or_else(|| "<unnamed>".to_string());
         let item_kind = item_kind_label(item);
 
-        let mut per_dep: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for (crate_id, type_path) in refs {
-            if let Some(dep_name) = dep_crate_ids.get(&crate_id) {
+        let mut per_dep: HashMap<&str, BTreeSet<String>> = HashMap::new();
+        for (crate_id, type_path) in &refs {
+            if let Some(dep_name) = dep_crate_ids.get(crate_id) {
                 per_dep
-                    .entry(dep_name.clone())
+                    .entry(dep_name)
                     .or_default()
-                    .insert(type_path);
+                    .insert(type_path.clone());
             }
         }
 
         for (dep_name, leaked_types) in per_dep {
-            result.entry(dep_name).or_default().push(LeakDetail {
-                item_name: item_name.clone(),
-                item_kind,
-                leaked_types,
-            });
+            result
+                .entry(dep_name.to_owned())
+                .or_default()
+                .push(LeakDetail {
+                    item_name: item_name.clone(),
+                    item_kind,
+                    leaked_types,
+                });
         }
     }
 
