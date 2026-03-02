@@ -46,17 +46,12 @@ pub struct DepInfluence {
     pub bump: Bump,
 }
 
-pub fn evaluate_crate_bump(
+pub fn evaluate_affected_deps<'a>(
     node: &Node,
-    ctx: &WorkspaceContext,
+    ctx: &'a WorkspaceContext,
     state: &mut WaveState,
-    opts: &AnalysisOptions,
-) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
-    let node_name = &ctx.pkg_names[&node.id];
-    let node_version = ctx.pkg_versions.get(node_name);
-
-    let affected_deps: Vec<(&str, ChangeKind)> = node
-        .deps
+) -> Vec<(&'a str, ChangeKind)> {
+    node.deps
         .iter()
         .filter(|d| d.pkg != node.id && is_normal_dep(d))
         .filter_map(|d| {
@@ -69,7 +64,19 @@ pub fn evaluate_crate_bump(
                 None
             }
         })
-        .collect();
+        .collect()
+}
+
+pub fn evaluate_crate_bump(
+    node: &Node,
+    ctx: &WorkspaceContext,
+    state: &mut WaveState,
+    opts: &AnalysisOptions,
+) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
+    let node_name = &ctx.pkg_names[&node.id];
+    let node_version = ctx.pkg_versions.get(node_name);
+
+    let affected_deps = evaluate_affected_deps(node, ctx, state);
 
     if affected_deps.is_empty() {
         return Ok((ChangeKind::None, Bump::None, vec![]));
