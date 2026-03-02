@@ -18,7 +18,8 @@ pub struct VersionChanges {
 }
 
 pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChanges> {
-    let changed_files = get_changed_cargo_tomls(source, target)?;
+    let base = merge_base(source, target)?;
+    let changed_files = get_changed_cargo_tomls(&base, target)?;
 
     let mut breaking_seeds: HashSet<String> = HashSet::new();
     let mut additive_seeds: HashSet<String> = HashSet::new();
@@ -27,7 +28,7 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
     println!("{}", "Detected version changes:".bold());
 
     for file in &changed_files {
-        let old_doc = read_toml_at_ref(source, file);
+        let old_doc = read_toml_at_ref(&base, file);
         let new_doc = read_toml_at_ref(target, file);
 
         let (old_doc, new_doc) = match (old_doc, new_doc) {
@@ -81,7 +82,7 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
             }
         }
 
-        let old_pkg = extract_package_version(&old_doc, source, file);
+        let old_pkg = extract_package_version(&old_doc, &base, file);
         let new_pkg = extract_package_version(&new_doc, target, file);
 
         if let (Ok((name, ov)), Ok((_, nv))) = (old_pkg, new_pkg) {
@@ -138,10 +139,23 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
     })
 }
 
-fn get_changed_cargo_tomls(source: &str, target: &str) -> Result<Vec<String>> {
-    let diff_range = format!("{}..{}", source, target);
+fn merge_base(source: &str, target: &str) -> Result<String> {
     let output = Command::new("git")
-        .args(["diff", "--name-only", &diff_range])
+        .args(["merge-base", source, target])
+        .output()
+        .context("Failed to run git merge-base")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git merge-base failed: {}", stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn get_changed_cargo_tomls(base: &str, target: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", base, target])
         .output()
         .context("Failed to run git diff")?;
 
