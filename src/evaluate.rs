@@ -37,6 +37,7 @@ pub struct AnalysisOptions {
     pub verbose: bool,
     pub rustdoc_stderr: bool,
     pub toolchain: String,
+    pub include_binaries: bool,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
@@ -78,6 +79,9 @@ pub fn evaluate_crate_bump(
     let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| *n).collect();
 
     if !ctx.pkg_has_lib.contains(node_name) {
+        if !opts.include_binaries {
+            return Ok((ChangeKind::None, Bump::None, vec![]));
+        }
         println!(
             "  {} {} is binary-only, no public API to leak",
             "->".dimmed(),

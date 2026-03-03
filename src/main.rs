@@ -82,6 +82,10 @@ struct Cli {
     /// Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15")
     #[arg(long, default_value = "nightly")]
     toolchain: String,
+
+    /// Include binary-only crates in the analysis (they are skipped by default)
+    #[arg(long)]
+    include_binaries: bool,
 }
 
 fn main() -> Result<()> {
@@ -95,6 +99,7 @@ fn main() -> Result<()> {
         verbose: cli.verbose,
         rustdoc_stderr: cli.rustdoc_stderr,
         toolchain: cli.toolchain,
+        include_binaries: cli.include_binaries,
     };
 
     let (all_seeds, mut state, local_bumps) = if let Some(direct_crates) = cli.direct {

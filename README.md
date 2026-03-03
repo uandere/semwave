@@ -93,6 +93,7 @@ Options:
   -t, --tree                   Print an influence tree showing how bumps propagate
       --rustdoc-stderr         Show cargo rustdoc stderr output (warnings, errors) during analysis
       --toolchain <TOOLCHAIN>  Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15") [default: nightly]
+      --include-binaries       Include binary-only crates in the analysis (they are skipped by default)
   -h, --help                   Print help
 ```
 
@@ -153,8 +154,6 @@ Analyzing tokio for public API exposure of ["pin-project-lite"]
   -> tokio leaks pin-project-lite (Major):
 Analyzing tests-build for public API exposure of ["tokio"]
   -> tests-build leaks tokio (Minor):
-  -> stress-test is binary-only, no public API to leak
-  -> benches is binary-only, no public API to leak
 Analyzing tokio-util for public API exposure of ["pin-project-lite", "tokio"]
   -> tokio-util leaks pin-project-lite (Minor):
   -> tokio-util leaks tokio (Minor):
@@ -168,10 +167,7 @@ Analyzing tests-integration for public API exposure of ["tokio", "tokio-test"]
 === Influence Tree ===
 └── pin-project-lite (seed)
     ├── tokio  (MAJOR)
-    │   ├── benches  (PATCH)
-    │   ├── stress-test  (PATCH)
     │   ├── tests-build  (MINOR)
-    │   ├── tests-integration  (PATCH)
     │   ├── tokio-stream  (MINOR)
     │   ├── tokio-test  (MINOR)
     │   │   └── tests-integration (PATCH, already shown above)
@@ -183,7 +179,7 @@ Analyzing tests-integration for public API exposure of ["tokio", "tokio-test"]
 === Analysis Complete ===
 MAJOR-bump list (Requires MAJOR bump / ↑.0.0): {"tokio"}
 MINOR-bump list (Requires MINOR bump / x.↑.0): {"tests-build", "tokio-stream", "tokio-test", "tokio-util"}
-PATCH-bump list (Requires PATCH bump / x.y.↑): {"benches", "stress-test", "tests-integration"}
+PATCH-bump list (Requires PATCH bump / x.y.↑): {"tests-integration"}
 ```
 
 > **Note:** tokio uses a custom `--cfg tokio_unstable` flag that gates parts of its API.
