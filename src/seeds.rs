@@ -15,6 +15,8 @@ pub struct VersionChanges {
     pub breaking_seeds: HashSet<String>,
     pub additive_seeds: HashSet<String>,
     pub local_bumps: HashMap<String, Bump>,
+    /// Crates whose Cargo.toml didn't exist on the base ref (newly added).
+    pub new_crates: HashSet<String>,
 }
 
 pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChanges> {
@@ -24,6 +26,7 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
     let mut breaking_seeds: HashSet<String> = HashSet::new();
     let mut additive_seeds: HashSet<String> = HashSet::new();
     let mut local_bumps: HashMap<String, Bump> = HashMap::new();
+    let mut new_crates: HashSet<String> = HashSet::new();
 
     println!("{}", "Detected version changes:".bold());
 
@@ -33,6 +36,29 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
 
         let (old_doc, new_doc) = match (old_doc, new_doc) {
             (Ok(o), Ok(n)) => (o, n),
+            (Err(_), Ok(n)) => {
+                if let Ok((name, _)) = extract_package_version(&n, target, file) {
+                    println!(
+                        "  {} {} {}",
+                        "[new]".dimmed(),
+                        name.cyan(),
+                        "(NEW CRATE)".green().bold()
+                    );
+                    new_crates.insert(name);
+                }
+                continue;
+            }
+            (Ok(o), Err(_)) => {
+                if let Ok((name, _)) = extract_package_version(&o, &base, file) {
+                    println!(
+                        "  {} {} {}",
+                        "[removed]".dimmed(),
+                        name.cyan(),
+                        "(REMOVED)".red().bold()
+                    );
+                }
+                continue;
+            }
             _ => continue,
         };
 
@@ -136,6 +162,7 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
         breaking_seeds,
         additive_seeds,
         local_bumps,
+        new_crates,
     })
 }
 
