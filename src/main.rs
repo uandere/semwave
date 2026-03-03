@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         include_binaries: cli.include_binaries,
     };
 
-    let (all_seeds, mut state, local_bumps) = if let Some(direct_crates) = cli.direct {
+    let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = cli.direct {
         let seeds: HashSet<String> = direct_crates.into_iter().collect();
         println!(
             "{} assuming BREAKING change for {}\n",
@@ -114,7 +114,7 @@ fn main() -> Result<()> {
             additive_crates: HashSet::new(),
             failed: HashSet::new(),
         };
-        (seeds, wave, HashMap::new())
+        (seeds, wave, HashMap::new(), HashSet::new())
     } else {
         println!(
             "Comparing versions between {} and {}...\n",
@@ -158,7 +158,7 @@ fn main() -> Result<()> {
             additive_crates: changes.additive_seeds,
             failed: HashSet::new(),
         };
-        (all_seeds, wave, changes.local_bumps)
+        (all_seeds, wave, changes.local_bumps, changes.new_crates)
     };
 
     let mut patch_crates: HashSet<String> = HashSet::new();
@@ -272,6 +272,12 @@ fn main() -> Result<()> {
         state.breaking_crates.remove(seed);
         state.additive_crates.remove(seed);
         patch_crates.remove(seed);
+    }
+
+    for name in &new_crates {
+        state.breaking_crates.remove(name);
+        state.additive_crates.remove(name);
+        patch_crates.remove(name);
     }
 
     for (name, existing_bump) in &local_bumps {
@@ -401,7 +407,11 @@ fn main() -> Result<()> {
     if !local_bumps.is_empty() {
         let missing: Vec<(&String, &Bump)> = all_required
             .iter()
-            .filter(|(name, _)| !local_bumps.contains_key(**name) && !state.failed.contains(**name))
+            .filter(|(name, _)| {
+                !local_bumps.contains_key(**name)
+                    && !state.failed.contains(**name)
+                    && !new_crates.contains(**name)
+            })
             .map(|(name, bump)| (*name, bump))
             .collect();
         if !missing.is_empty() {
