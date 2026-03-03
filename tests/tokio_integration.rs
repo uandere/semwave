@@ -100,7 +100,7 @@ fn run_semwave(extra_args: &[&str]) -> (String, String, bool) {
 ///
 ///   MAJOR: {"tokio"}              (tokio >= 1.0.0, leaks pin-project-lite → Major)
 ///   MINOR: {"tests-build", "tokio-stream", "tokio-test", "tokio-util"}
-///   PATCH: {"benches", "stress-test", "tests-integration"}
+///   PATCH: {}                     (binary-only crates are skipped by default)
 ///
 /// Exit code is 0 (direct mode, no local_bumps to compare against).
 #[test]
@@ -155,10 +155,10 @@ fn tokio_direct_pin_project_lite() {
         "tokio-util should require MINOR.\nMINOR line: {minor_line}\nfull stdout:\n{stdout}"
     );
 
-    // Binary-only crates get PATCH.
+    // Binary-only crates are skipped by default.
     assert!(
-        patch_line.contains("benches") || patch_line.contains("stress-test"),
-        "binary-only crates should appear in PATCH.\nPATCH line: {patch_line}\nfull stdout:\n{stdout}"
+        !patch_line.contains("benches") && !patch_line.contains("stress-test"),
+        "binary-only crates should NOT appear when --include-binaries is off.\nPATCH line: {patch_line}\nfull stdout:\n{stdout}"
     );
 }
 
