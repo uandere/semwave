@@ -38,6 +38,7 @@ pub struct AnalysisOptions {
     pub rustdoc_stderr: bool,
     pub toolchain: String,
     pub include_binaries: bool,
+    pub tree: bool,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
@@ -76,6 +77,10 @@ pub fn evaluate_crate_bump(
 ) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
     let node_name = &ctx.pkg_names[&node.id];
     let node_version = ctx.pkg_versions.get(node_name);
+
+    if !opts.tree && state.breaking_crates.contains(node_name.as_str()) {
+        return Ok((ChangeKind::None, Bump::None, vec![]));
+    }
 
     let affected_deps = evaluate_affected_deps(node, ctx, state);
 

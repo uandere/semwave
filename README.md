@@ -49,6 +49,7 @@ flowchart LR
 ## Features
 
 - **Static analysis only** - no need to compile every dependent crate or run their test suites. The tool analyzes rustdoc JSON to detect leaked types, so results arrive in seconds, not hours.
+- **Skips redundant analysis** - if a crate is already at the maximum bump level (breaking), it won't be re-analyzed when a dependency triggers another wave iteration. In large workspaces with many inter-dependent seeds this avoids dozens of unnecessary `cargo rustdoc` invocations. (Disabled when `--tree` is passed, so the influence tree stays complete.)
 - **Transitive propagation** - a bump in crate A that leaks into crate B automatically makes B a new seed. The wave keeps going until no new leaks are found, catching cascading effects that humans routinely miss.
 - **Semver-scheme-aware** - correctly distinguishes `0.y.z` (where a minor bump is breaking) from `>=1.0.0` (where a minor bump is additive). Bump recommendations respect whichever scheme the consumer crate uses.
 - **Under-bump detection** - if a crate already has a version bump in the diff but that bump is *insufficient* (e.g., PATCH when MINOR is required), `semwave` flags it explicitly.
@@ -93,9 +94,11 @@ Options:
   -t, --tree                   Print an influence tree showing how bumps propagate
       --rustdoc-stderr         Show cargo rustdoc stderr output (warnings, errors) during analysis
       --toolchain <TOOLCHAIN>  Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15") [default: nightly]
-      --include-binaries       Include binary-only crates in the analysis (they are skipped by default)
+      --include-binaries       Include binary-only crates in the analysis (skipped by default)
   -h, --help                   Print help
 ```
+
+> **Note:** By default, `semwave` skips re-analyzing crates that are already at the maximum bump level (breaking), which can dramatically speed up runs in large workspaces with many inter-dependent seeds. Passing `--tree` disables this optimization so the full influence tree can be built, which may result in noticeably longer analysis times.
 
 ## FAQ
 

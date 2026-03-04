@@ -83,7 +83,7 @@ struct Cli {
     #[arg(long, default_value = "nightly")]
     toolchain: String,
 
-    /// Include binary-only crates in the analysis (they are skipped by default)
+    /// Include binary-only crates in the analysis (skipped by default)
     #[arg(long)]
     include_binaries: bool,
 }
@@ -100,6 +100,7 @@ fn main() -> Result<()> {
         rustdoc_stderr: cli.rustdoc_stderr,
         toolchain: cli.toolchain,
         include_binaries: cli.include_binaries,
+        tree: cli.tree,
     };
 
     let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = cli.direct {
