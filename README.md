@@ -171,6 +171,7 @@ Analyzing tests-integration for public API exposure of ["tokio", "tokio-test"]
 └── pin-project-lite (seed)
     ├── tokio  (MAJOR)
     │   ├── tests-build  (MINOR)
+    │   ├── tests-integration  (PATCH)
     │   ├── tokio-stream  (MINOR)
     │   ├── tokio-test  (MINOR)
     │   │   └── tests-integration (PATCH, already shown above)
@@ -205,7 +206,6 @@ Direct mode: assuming BREAKING change for {"arrayvec", "itertools"}
 
 Analyzing stdx for public API exposure of ["itertools"]
   -> stdx leaks itertools (Minor):
-  -> xtask is binary-only, no public API to leak
 Analyzing vfs for public API exposure of ["stdx"]
   -> vfs leaks stdx (Minor):
 Analyzing test-utils for public API exposure of ["stdx"]
@@ -345,6 +345,6 @@ Analyzing rust-analyzer for public API exposure of ["cfg", "hir", "hir-def", "hi
   -> rust-analyzer leaks vfs (Minor):
 === Analysis Complete ===
 MAJOR-bump list (Requires MAJOR bump / ↑.0.0): {}
-MINOR-bump list (Requires MINOR bump / x.↑.0): {"project-model", "syntax-bridge", "proc-macro-srv", "load-cargo", "hir-expand", "ide-completion", "hir-def", "cfg", "vfs", "ide-diagnostics", "ide", "ide-db", "span", "ide-ssr", "rust-analyzer", "ide-assists", "base-db", "stdx", "syntax", "test-utils", "vfs-notify", "hir-ty", "proc-macro-api", "tt", "test-fixture", "hir", "mbe", "proc-macro-srv-cli"}
-PATCH-bump list (Requires PATCH bump / x.y.↑): {"xtask"}
+MINOR-bump list (Requires MINOR bump / x.↑.0): {"base-db", "cfg", "hir", "hir-def", "hir-expand", "hir-ty", "ide", "ide-assists", "ide-completion", "ide-db", "ide-diagnostics", "ide-ssr", "load-cargo", "mbe", "proc-macro-api", "proc-macro-srv", "proc-macro-srv-cli", "project-model", "rust-analyzer", "span", "stdx", "syntax", "syntax-bridge", "test-fixture", "test-utils", "tt", "vfs", "vfs-notify"}
+PATCH-bump list (Requires PATCH bump / x.y.↑): {}
 ```
