@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use crate::{
-    leak::find_leaked_deps,
-    semver::{Bump, ChangeKind, required_bump},
-};
-use anyhow::{Context, Result};
-use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
+use crate::leak::find_leaked_deps;
+use crate::semver::{Bump, ChangeKind, required_bump};
+use anyhow::Context;
+use cargo_metadata::{DependencyKind, Metadata, Node, NodeDep, PackageId};
 use colored::Colorize as _;
 use semver::Version;
 
@@ -23,6 +22,41 @@ pub struct WorkspaceContext {
     pub pkg_manifest_paths: HashMap<String, String>,
     pub pkg_has_lib: HashSet<String>,
     pub pkg_versions: HashMap<String, Version>,
+    pub workspace_members: HashSet<PackageId>,
+}
+
+impl WorkspaceContext {
+    pub fn from_metadata(metadata: &Metadata) -> Self {
+        let workspace_members: HashSet<PackageId> =
+            metadata.workspace_members.iter().cloned().collect();
+        WorkspaceContext {
+            pkg_names: metadata
+                .packages
+                .iter()
+                .map(|p| (p.id.clone(), p.name.to_string()))
+                .collect(),
+            pkg_manifest_paths: metadata
+                .packages
+                .iter()
+                .filter(|p| workspace_members.contains(&p.id))
+                .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
+                .collect(),
+            pkg_has_lib: metadata
+                .packages
+                .iter()
+                .filter(|p| workspace_members.contains(&p.id))
+                .filter(|p| p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()))
+                .map(|p| p.name.to_string())
+                .collect(),
+            pkg_versions: metadata
+                .packages
+                .iter()
+                .filter(|p| workspace_members.contains(&p.id))
+                .map(|p| (p.name.to_string(), p.version.clone()))
+                .collect(),
+            workspace_members,
+        }
+    }
 }
 
 /// Mutable state accumulated during the propagation wave.
@@ -30,6 +64,28 @@ pub struct WaveState {
     pub breaking_crates: HashSet<String>,
     pub additive_crates: HashSet<String>,
     pub failed: HashSet<String>,
+}
+
+impl WaveState {
+    pub fn record_change(
+        &mut self,
+        name: &str,
+        change: ChangeKind,
+        patch_crates: &mut HashSet<String>,
+    ) {
+        match change {
+            ChangeKind::Breaking => {
+                self.breaking_crates.insert(name.to_owned());
+            }
+            ChangeKind::Additive => {
+                self.additive_crates.insert(name.to_owned());
+            }
+            ChangeKind::Patch => {
+                patch_crates.insert(name.to_owned());
+            }
+            ChangeKind::None => {}
+        }
+    }
 }
 
 /// Per-crate analysis options.
@@ -47,10 +103,25 @@ pub struct DepInfluence {
     pub bump: Bump,
 }
 
+/// Per-crate pre-check result: whether we need to build a `rustdoc` JSON.
+pub enum PreCheckResult<'a> {
+    EarlyReturn(ChangeKind, Bump, Vec<DepInfluence>),
+    NeedsRustdoc {
+        manifest: String,
+        affected_deps: Vec<(&'a str, ChangeKind)>,
+    },
+}
+
+/// Result of analyzing a single crate's rustdoc JSON for leaked dependencies.
+pub struct CrateAnalysis {
+    pub worst_change: ChangeKind,
+    pub influences: Vec<DepInfluence>,
+}
+
 pub fn evaluate_affected_deps<'a>(
     node: &Node,
     ctx: &'a WorkspaceContext,
-    state: &mut WaveState,
+    state: &WaveState,
 ) -> Vec<(&'a str, ChangeKind)> {
     node.deps
         .iter()
@@ -68,26 +139,35 @@ pub fn evaluate_affected_deps<'a>(
         .collect()
 }
 
-pub fn evaluate_crate_bump(
+/// Determine whether we need to build `rustdoc` JSON for `node`, or not.
+pub fn pre_check_crate<'a>(
     node: &Node,
-    ctx: &WorkspaceContext,
-    state: &mut WaveState,
+    ctx: &'a WorkspaceContext,
+    state: &WaveState,
     opts: &AnalysisOptions,
-) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
+) -> anyhow::Result<PreCheckResult<'a>> {
     let node_name = &ctx.pkg_names[&node.id];
     let node_version = ctx.pkg_versions.get(node_name);
 
     let affected_deps = evaluate_affected_deps(node, ctx, state);
 
     if affected_deps.is_empty() {
-        return Ok((ChangeKind::None, Bump::None, vec![]));
+        return Ok(PreCheckResult::EarlyReturn(
+            ChangeKind::None,
+            Bump::None,
+            vec![],
+        ));
     }
 
     let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| *n).collect();
 
     if !ctx.pkg_has_lib.contains(node_name) {
         if !opts.include_binaries {
-            return Ok((ChangeKind::None, Bump::None, vec![]));
+            return Ok(PreCheckResult::EarlyReturn(
+                ChangeKind::None,
+                Bump::None,
+                vec![],
+            ));
         }
         println!(
             "  {} {} is binary-only, no public API to leak",
@@ -104,7 +184,11 @@ pub fn evaluate_crate_bump(
                 bump: Bump::Patch,
             })
             .collect();
-        return Ok((ChangeKind::Patch, bump, influences));
+        return Ok(PreCheckResult::EarlyReturn(
+            ChangeKind::Patch,
+            bump,
+            influences,
+        ));
     }
 
     println!(
@@ -116,47 +200,25 @@ pub fn evaluate_crate_bump(
     let manifest = ctx
         .pkg_manifest_paths
         .get(node_name)
-        .with_context(|| format!("No manifest path for {}", node_name))?;
+        .with_context(|| format!("No manifest path for {}", node_name))?
+        .clone();
 
-    let json_path = match rustdoc_json::Builder::default()
-        .toolchain(&opts.toolchain)
-        .manifest_path(manifest)
-        .all_features(true)
-        .cap_lints(Some("allow"))
-        .silent(!opts.rustdoc_stderr)
-        .build()
-    {
-        Ok(path) => path,
-        Err(e) => {
-            let worst_change = affected_deps
-                .iter()
-                .map(|(_, ck)| *ck)
-                .max()
-                .unwrap_or(ChangeKind::Breaking);
-            let conservative_bump = node_version
-                .map(|v| required_bump(v, worst_change))
-                .unwrap_or(Bump::Minor);
-            eprintln!(
-                "  {} rustdoc JSON generation failed for {}: {}\n  \
-                 Conservatively assuming {} bump.",
-                "WARNING:".yellow().bold(),
-                node_name.cyan(),
-                e,
-                conservative_bump
-            );
-            state.failed.insert(node_name.to_owned());
-            let influences = affected_deps
-                .into_iter()
-                .map(|(dep_name, _)| DepInfluence {
-                    dep_name: dep_name.to_owned(),
-                    bump: conservative_bump,
-                })
-                .collect();
-            return Ok((worst_change, conservative_bump, influences));
-        }
-    };
+    Ok(PreCheckResult::NeedsRustdoc {
+        manifest,
+        affected_deps,
+    })
+}
 
-    let json_str = std::fs::read_to_string(&json_path)
+/// Analyze a crate's rustdoc JSON to determine which affected deps are leaked
+/// in the public API and compute the resulting bump.
+pub fn analyze_rustdoc(
+    node_name: &str,
+    json_path: &Path,
+    affected_deps: &[(&str, ChangeKind)],
+    node_version: Option<&Version>,
+    opts: &AnalysisOptions,
+) -> anyhow::Result<CrateAnalysis> {
+    let json_str = std::fs::read_to_string(json_path)
         .with_context(|| format!("Failed to read rustdoc JSON for {}", node_name))?;
     let krate: rustdoc_types::Crate = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse rustdoc JSON for {}", node_name))?;
@@ -184,7 +246,7 @@ pub fn evaluate_crate_bump(
 
         if is_leaked {
             let edge_bump = node_version
-                .map(|v| required_bump(v, dep_change))
+                .map(|v| required_bump(v, *dep_change))
                 .unwrap_or(Bump::Minor);
             println!(
                 "  {} {} leaks {} ({}):",
@@ -214,21 +276,54 @@ pub fn evaluate_crate_bump(
                 }
             }
             influences.push(DepInfluence {
-                dep_name: dep_name.to_owned(),
+                dep_name: dep_name.to_string(),
                 bump: edge_bump,
             });
-            worst_change = worst_change.max(dep_change);
+            worst_change = worst_change.max(*dep_change);
         } else {
             influences.push(DepInfluence {
-                dep_name: dep_name.to_owned(),
+                dep_name: dep_name.to_string(),
                 bump: Bump::Patch,
             });
         }
     }
 
-    let final_bump = node_version
-        .map(|v| required_bump(v, worst_change))
-        .unwrap_or(Bump::Patch);
+    Ok(CrateAnalysis {
+        worst_change,
+        influences,
+    })
+}
 
-    Ok((worst_change, final_bump, influences))
+/// When rustdoc JSON generation fails, assume the worst and return conservative
+/// bump estimates. Prints a warning to stderr.
+pub fn conservative_fallback(
+    node_name: &str,
+    affected_deps: &[(&str, ChangeKind)],
+    node_version: Option<&Version>,
+    error: &anyhow::Error,
+) -> (ChangeKind, Vec<DepInfluence>) {
+    let worst_change = affected_deps
+        .iter()
+        .map(|(_, ck)| *ck)
+        .max()
+        .unwrap_or(ChangeKind::Breaking);
+    let conservative_bump = node_version
+        .map(|v| required_bump(v, worst_change))
+        .unwrap_or(Bump::Minor);
+    eprintln!(
+        "  {} rustdoc JSON generation failed for {}: {}\n  \
+         Conservatively assuming {} bump.",
+        "WARNING:".yellow().bold(),
+        node_name.cyan(),
+        error,
+        conservative_bump
+    );
+    let influences = affected_deps
+        .iter()
+        .map(|(dep_name, _)| DepInfluence {
+            dep_name: dep_name.to_string(),
+            bump: conservative_bump,
+        })
+        .collect();
+    (worst_change, influences)
 }

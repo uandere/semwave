@@ -94,6 +94,7 @@ Options:
       --rustdoc-stderr         Show cargo rustdoc stderr output (warnings, errors) during analysis
       --toolchain <TOOLCHAIN>  Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15") [default: nightly]
       --include-binaries       Include binary-only crates in the analysis (they are skipped by default)
+  -j, --jobs <JOBS>            Number of parallel rustdoc jobs (defaults to number of CPU cores)
   -h, --help                   Print help
 ```
 
