@@ -1,12 +1,14 @@
+![waves](assets/sea.jpg)
+
 # 🌊 semwave
 
 `semwave` is a static analysis tool that answers the question:
 
 > "If I bump crates A, B and C in this Rust project - what else do I need to bump and how?"
 
-It will help you to push changes faster and not break other people's code.
+It will help you to ensure that changes in multi-repo Rust workspaces don't violate SemVer rules.  
 
-## Current state
+## Current State
 
 ⚠️ This project is under active development, and may change its behavior drastically over time. ⚠️
 
@@ -14,15 +16,26 @@ Feel free to contribute, ask questions and propose new features.
 
 ## Motivation
 
-Many developers unintentionally violate semver rules in Rust projects they contribute to.
-Large workspaces have deep dependency graphs, re-exports that hide where a type actually comes from, and version schemes that change the meaning of each bump level - all of which make it nearly impossible to manually determine what needs a version bump and how big. `semwave` automates that analysis so you don't have to.
+Many developers unintentionally violate SemVer rules in Rust workspaces by **incorrectly bumping the dependents of the crates they bumped** (or not bumping them at all). This causes issues with publishing - as `cargo publish` requires all dependencies to be resolved to specific, valid versions, and failing to propagate bumps can lead to "Type Mismatch: expected type X, found type X" errors for downstream users.
 
-## How it works?
+Identifying manually whether a crate depends in a breaking or a non-breaking way on some other crate has long been recognized as a stupidly hard task. This is because the definitions in a dependency have so many ways to "sneak" into the dependent's public API:
+- Complex generics with lots of boundaries
+- Re-exports, especially under different names
+- Deeply nested structs with public fields
+- `impl Trait` in return positions
+- Trait implementations on foreign types & blanket implementations
+- Type aliases (e.g. `pub type Client = other_crate::Client`)
+
+...and many more!
+
+As if that wasn't enough, you need to perform those checks on **every single crate that got any of its dependency version updated** in the workspace. Large workspaces have deep dependency graphs, re-exports that hide where a type actually comes from, and version schemes that change the meaning of each bump level. All that makes it nearly *impossible* to manually determine what needs a version bump and how big. `semwave` automates that analysis so you don't have to.
+
+## How Does It Work?
 
 1. Accepts the list of breaking version bumps (the "seeds"). By default, this means `diff`-ing `Cargo.toml` files 
 between two git refs, identifying crates whose dependency versions changed in breaking or
-additive ways. You can also use `--direct` mode with comma-separated crates, which will tell `semwave`
-directly which seeds to check against.
+additive ways. You can also use `--direct` mode with comma-separated crates, which will tell `semwave` to 
+"suppose" that the given crates were bumped in a breaking manner.
 
 2. Walks the workspace dependency graph starting from the seeds. For each dependent,
 it checks whether the crate leaks any seed types in its public API. If it does, that
@@ -48,21 +61,20 @@ flowchart LR
 
 ## Features
 
-- **Static analysis only** - no need to compile every dependent crate or run their test suites. The tool analyzes rustdoc JSON to detect leaked types, so results arrive in seconds, not hours.
-- **Skips redundant analysis** - if a crate is already at the maximum bump level (breaking), it won't be re-analyzed when a dependency triggers another wave iteration. In large workspaces with many inter-dependent seeds this avoids dozens of unnecessary `cargo rustdoc` invocations. (Disabled when `--tree` is passed, so the influence tree stays complete.)
+- **Skips redundant analysis** - the tool only analyzes the crates that are potentially affected. Also, if a crate is already at the maximum bump level (breaking), it won't be reanalyzed when a dependency triggers another wave iteration. In large workspaces with many inter-dependent seeds this avoids dozens of unnecessary `cargo rustdoc` invocations. (Disabled when `--tree` is passed, so the influence tree stays complete.)
 - **Transitive propagation** - a bump in crate A that leaks into crate B automatically makes B a new seed. The wave keeps going until no new leaks are found, catching cascading effects that humans routinely miss.
 - **Semver-scheme-aware** - correctly distinguishes `0.y.z` (where a minor bump is breaking) from `>=1.0.0` (where a minor bump is additive). Bump recommendations respect whichever scheme the consumer crate uses.
 - **Under-bump detection** - if a crate already has a version bump in the diff but that bump is *insufficient* (e.g., PATCH when MINOR is required), `semwave` flags it explicitly.
 - **Two input modes** - git-diff mode automatically discovers seeds from `Cargo.toml` changes between two refs; direct mode lets you ask hypothetical "what if?" questions without touching git.
-- **Influence tree** - the `--tree` flag prints a human-readable tree showing exactly how and why each bump propagates, making it easy to explain the reasoning to reviewers.
+- **Verbose Mode & Influence tree** - the `--verbose` flag shows exact definitions being leaked, while the `--tree` flag prints a human-readable tree showing exactly how and why each bump propagates, making it easy to explain the reasoning to reviewers.
 
 ## Limitations
 
-- **Requires a nightly toolchain** - rustdoc JSON output is a nightly-only feature. This can be a friction point in CI environments locked to stable.
-- **Type-level only** - `semwave` detects leaked *types*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
+- **Requires a nightly toolchain** - rustdoc JSON output is a nightly-only feature.
+- **Type-level only** - `semwave` detects leaked *definitions*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
 - **Complex version requirements are unsupported** - ranges (`>=1.2, <2`), wildcards (`1.*`), and multi-constraint specs are skipped during seed detection.
 - **Cargo projects only** - the tool is purpose-built for Rust/Cargo. It won't help with polyglot monorepos or non-Cargo Rust projects.
-- **Rustdoc failures are handled conservatively** - if a crate fails to generate rustdoc JSON (e.g., due to nightly failing to build non-nightly code or missing compiler components), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping. This is a safe choice, as it prevents false negatives, but it also means that you need to do some manual work sometimes. 
+- **Rustdoc failures are handled conservatively** - if a crate fails to generate rustdoc JSON (e.g., due to nightly failing to build non-nightly code or missing features), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping. This is a safe choice, as it prevents false negatives, but it also means that you need to do some manual work sometimes. 
 
 ## Installation
 
@@ -104,11 +116,15 @@ Options:
 
 ### Why not just use `cargo-semver-checks` / `release-plz`?
 
-Those tools answer a different question. `cargo-semver-checks` tells you whether a single crate's public API changed in a breaking way. `release-plz` automates the release workflow for individual crates. Neither of them propagates bumps: if crate A gets a breaking change and crate B re-exports a type from A, those tools won't tell you that B also needs a bump. `semwave` exists specifically for that transitive propagation problem.
+Those tools answer a different question. `cargo-semver-checks` tells you whether a **single crate's** public API changed in a breaking way. `release-plz` automates the release workflow for **individual crates**. Neither of them propagates bumps: if crate A gets a breaking change and crate B re-exports a type from A, those tools won't tell you that B also needs a bump. `semwave` exists specifically for that transitive propagation problem.
 
 ### Does `semwave` detect breaking API changes itself?
 
 No. It takes a set of already-known version changes (either from a git diff or from `--direct` mode) and figures out what *else* needs to bump as a consequence. It does not compare two versions of a crate's API to decide whether the change is breaking. Pair it with `cargo-semver-checks` for full coverage: let `cargo-semver-checks` find the initial breaking changes, then let `semwave` propagate them.
+
+### What version changes does `semwave` detect?
+
+Both internal workspace crate bumps and external dependency version changes are detected and used as seeds for the analysis.
 
 ### Why does it need a nightly toolchain?
 
@@ -123,15 +139,15 @@ A crate "leaks" a dependency when a type from that dependency appears in the cra
 
 ### Does `semvawe` has fasle positives / negatives?
 
-It shouldn't, in theory. If it does and you can prove it - this is a bug. Please, report it via MR.
+It shouldn't, in theory. If it does and you can prove it - this is a bug. Please, report it via GitHub issues.
 
-### What happens when rustdoc fails for a crate?
+### What happens when `rustdoc` fails for a crate?
 
 `semwave` assumes the worst case: it treats the crate as if it leaks all affected dependencies at their highest bump level, and prints a warning. This is conservative by design - it may lead to over-bumping, but it prevents you from accidentally under-bumping. You can pass `--rustdoc-stderr` to see the actual rustdoc errors and fix them.
 
 ### Can I use this in CI?
 
-Yes, but only experimentally (because of potential over-bumping propagation). Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code 1 when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
+Yes, but only experimentally (because of potential over-bumping propagation and inability to skip singular crates). Run `semwave --source origin/main --target HEAD --no-color` in your CI pipeline. The tool exits with code `1` when it finds crates that are missing a version bump or have an insufficient one, so your CI job will fail automatically. Crates where rustdoc generation failed are reported as warnings but do not cause a non-zero exit on their own - only confirmed missing or insufficient bumps do.
 
 ### Does it handle workspace version inheritance?
 
