@@ -31,39 +31,19 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
     println!("{}", "Detected version changes:".bold());
 
     for file in &changed_files {
-        let old_doc = read_toml_at_ref(&base, file);
-        let new_doc = read_toml_at_ref(target, file);
-
-        let (old_doc, new_doc) = match (old_doc, new_doc) {
-            (Ok(o), Ok(n)) => (o, n),
-            (Err(_), Ok(n)) => {
-                if let Ok((name, _)) = extract_package_version(&n, target, file) {
-                    println!(
-                        "  {} {} {}",
-                        "[new]".dimmed(),
-                        name.cyan(),
-                        "(NEW CRATE)".green().bold()
-                    );
+        let (old_toml, new_toml) = match get_toml_file_change(&base, target, file) {
+            Some(TomlFileChange::Added { name }) => {
+                if let Some(name) = name {
                     new_crates.insert(name);
                 }
                 continue;
             }
-            (Ok(o), Err(_)) => {
-                if let Ok((name, _)) = extract_package_version(&o, &base, file) {
-                    println!(
-                        "  {} {} {}",
-                        "[removed]".dimmed(),
-                        name.cyan(),
-                        "(REMOVED)".red().bold()
-                    );
-                }
-                continue;
-            }
+            Some(TomlFileChange::Changed { old_toml, new_toml }) => (old_toml, new_toml),
             _ => continue,
         };
 
-        let old_deps = extract_dep_versions(&old_doc);
-        let new_deps = extract_dep_versions(&new_doc);
+        let old_deps = extract_dep_versions(&old_toml);
+        let new_deps = extract_dep_versions(&new_toml);
 
         for (name, new_ver_str) in &new_deps {
             let Some(old_ver_str) = old_deps.get(name) else {
@@ -108,52 +88,75 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
             }
         }
 
-        let old_pkg = extract_package_version(&old_doc, &base, file);
-        let new_pkg = extract_package_version(&new_doc, target, file);
+        let old_pkg = extract_package_version(&old_toml, &base, file);
+        let new_pkg = extract_package_version(&new_toml, target, file);
 
-        if let (Ok((name, ov)), Ok((_, nv))) = (old_pkg, new_pkg) {
-            if local_bumps.contains_key(&name) {
-                continue;
-            }
-            let change = classify_version_change(&ov, &nv);
-            let bump = required_bump(&ov, change);
-            match change {
-                ChangeKind::Breaking => {
-                    println!(
-                        "  {} {}: {} -> {} {}",
-                        "[local]".dimmed(),
-                        name.cyan(),
-                        ov.to_string().dimmed(),
-                        nv.to_string().white().bold(),
-                        "(BREAKING)".red().bold()
+        if let (Ok((name, ov)), Ok((_, nv))) = (old_pkg, new_pkg)
+            && !local_bumps.contains_key(&name)
+        {
+            record_local_bump(
+                name,
+                &ov,
+                &nv,
+                "",
+                &mut breaking_seeds,
+                &mut additive_seeds,
+                &mut local_bumps,
+            );
+        }
+
+        // Workspace root version change: propagate to members using version.workspace = true
+        if let (Some(old_ws_ver), Some(new_ws_ver)) = (
+            extract_workspace_package_version(&old_toml),
+            extract_workspace_package_version(&new_toml),
+        ) && old_ws_ver != new_ws_ver
+        {
+            let workspace_dir = Path::new(file).parent().unwrap_or(Path::new(""));
+            for member_rel in extract_workspace_members(&new_toml) {
+                if member_rel.contains('*') {
+                    eprintln!(
+                        "Warning: skipping glob workspace member '{}' for version inheritance",
+                        member_rel
                     );
-                    breaking_seeds.insert(name.clone());
-                    local_bumps.insert(name, bump);
+                    continue;
                 }
-                ChangeKind::Additive => {
-                    println!(
-                        "  {} {}: {} -> {} {}",
-                        "[local]".dimmed(),
-                        name.cyan(),
-                        ov.to_string().dimmed(),
-                        nv.to_string().white().bold(),
-                        "(ADDITIVE)".yellow().bold()
+                let member_toml = if workspace_dir == Path::new("") {
+                    format!("{}/Cargo.toml", member_rel)
+                } else {
+                    format!("{}/{}/Cargo.toml", workspace_dir.display(), member_rel)
+                };
+                if changed_files.contains(&member_toml) {
+                    continue;
+                }
+                let Ok(member_doc) = read_toml_at_ref(target, &member_toml) else {
+                    continue;
+                };
+                let Some(pkg) = member_doc.get("package") else {
+                    continue;
+                };
+                let inherits = pkg
+                    .get("version")
+                    .and_then(|v| v.get("workspace"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                if !inherits {
+                    continue;
+                }
+                let Some(name) = pkg.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let name = name.to_string();
+                if !local_bumps.contains_key(&name) {
+                    record_local_bump(
+                        name,
+                        &old_ws_ver,
+                        &new_ws_ver,
+                        "[workspace]",
+                        &mut breaking_seeds,
+                        &mut additive_seeds,
+                        &mut local_bumps,
                     );
-                    additive_seeds.insert(name.clone());
-                    local_bumps.insert(name, bump);
                 }
-                ChangeKind::Patch => {
-                    println!(
-                        "  {} {}: {} -> {} {}",
-                        "[local]".dimmed(),
-                        name.cyan(),
-                        ov.to_string().dimmed(),
-                        nv.to_string().white().bold(),
-                        "(PATCH)".green()
-                    );
-                    local_bumps.insert(name, Bump::Patch);
-                }
-                ChangeKind::None => {}
             }
         }
     }
@@ -164,6 +167,54 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
         local_bumps,
         new_crates,
     })
+}
+
+enum TomlFileChange {
+    Added {
+        name: Option<String>,
+    },
+    Removed,
+    Changed {
+        old_toml: toml::Value,
+        new_toml: toml::Value,
+    },
+}
+
+fn get_toml_file_change(base: &str, target: &str, filename: &str) -> Option<TomlFileChange> {
+    let old_toml = read_toml_at_ref(base, filename);
+    let new_toml = read_toml_at_ref(target, filename);
+
+    let (old_toml, new_toml) = match (old_toml, new_toml) {
+        (Ok(o), Ok(n)) => (o, n),
+        (Err(_), Ok(n)) => {
+            let name = if let Ok((name, _)) = extract_package_version(&n, target, filename) {
+                println!(
+                    "  {} {} {}",
+                    "[new]".dimmed(),
+                    name.cyan(),
+                    "(NEW CRATE)".green().bold()
+                );
+                Some(name)
+            } else {
+                None
+            };
+            return Some(TomlFileChange::Added { name });
+        }
+        (Ok(o), Err(_)) => {
+            if let Ok((name, _)) = extract_package_version(&o, base, filename) {
+                println!(
+                    "  {} {} {}",
+                    "[removed]".dimmed(),
+                    name.cyan(),
+                    "(REMOVED)".red().bold()
+                );
+            }
+            return Some(TomlFileChange::Removed);
+        }
+        _ => return None,
+    };
+
+    Some(TomlFileChange::Changed { old_toml, new_toml })
 }
 
 fn merge_base(source: &str, target: &str) -> Result<String> {
@@ -343,6 +394,79 @@ fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Versio
             );
         }
     }
+}
+
+fn change_kind_label(change: ChangeKind) -> Option<String> {
+    match change {
+        ChangeKind::Breaking => Some("(BREAKING)".red().bold().to_string()),
+        ChangeKind::Additive => Some("(ADDITIVE)".yellow().bold().to_string()),
+        ChangeKind::Patch => Some("(PATCH)".green().to_string()),
+        ChangeKind::None => None,
+    }
+}
+
+fn record_local_bump(
+    name: String,
+    ov: &Version,
+    nv: &Version,
+    context: &str,
+    breaking_seeds: &mut HashSet<String>,
+    additive_seeds: &mut HashSet<String>,
+    local_bumps: &mut HashMap<String, Bump>,
+) {
+    let change = classify_version_change(ov, nv);
+    let Some(label) = change_kind_label(change) else {
+        return;
+    };
+    let bump = required_bump(ov, change);
+    let suffix = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", context.dimmed())
+    };
+    println!(
+        "  {} {}: {} -> {} {}{}",
+        "[local]".dimmed(),
+        name.cyan(),
+        ov.to_string().dimmed(),
+        nv.to_string().white().bold(),
+        label,
+        suffix,
+    );
+    match change {
+        ChangeKind::Breaking => {
+            breaking_seeds.insert(name.clone());
+            local_bumps.insert(name, bump);
+        }
+        ChangeKind::Additive => {
+            additive_seeds.insert(name.clone());
+            local_bumps.insert(name, bump);
+        }
+        ChangeKind::Patch => {
+            local_bumps.insert(name, Bump::Patch);
+        }
+        ChangeKind::None => {}
+    }
+}
+
+fn extract_workspace_package_version(doc: &toml::Value) -> Option<Version> {
+    doc.get("workspace")?
+        .get("package")?
+        .get("version")?
+        .as_str()
+        .and_then(|s| Version::parse(s).ok())
+}
+
+fn extract_workspace_members(doc: &toml::Value) -> Vec<String> {
+    doc.get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -531,5 +655,77 @@ mod tests {
         .parse()
         .unwrap();
         assert!(extract_package_version(&doc, "HEAD", "Cargo.toml").is_err());
+    }
+
+    #[test]
+    fn extract_workspace_package_version_present() {
+        let doc: toml::Value = r#"
+            [workspace.package]
+            version = "0.10.0"
+        "#
+        .parse()
+        .unwrap();
+        let ver = extract_workspace_package_version(&doc).unwrap();
+        assert_eq!(ver, Version::parse("0.10.0").unwrap());
+    }
+
+    #[test]
+    fn extract_workspace_package_version_absent() {
+        let doc: toml::Value = r#"
+            [workspace]
+            members = ["foo"]
+        "#
+        .parse()
+        .unwrap();
+        assert!(extract_workspace_package_version(&doc).is_none());
+    }
+
+    #[test]
+    fn extract_workspace_package_version_non_workspace_manifest() {
+        let doc: toml::Value = r#"
+            [package]
+            name = "my-crate"
+            version = "1.0.0"
+        "#
+        .parse()
+        .unwrap();
+        assert!(extract_workspace_package_version(&doc).is_none());
+    }
+
+    #[test]
+    fn extract_workspace_members_returns_paths() {
+        let doc: toml::Value = r#"
+            [workspace]
+            members = ["tokio", "axum"]
+        "#
+        .parse()
+        .unwrap();
+        let members = extract_workspace_members(&doc);
+        assert_eq!(members, vec!["tokio", "axum"]);
+    }
+
+    #[test]
+    fn extract_workspace_members_empty_when_missing() {
+        let doc: toml::Value = r#"
+            [package]
+            name = "my-crate"
+            version = "1.0.0"
+        "#
+        .parse()
+        .unwrap();
+        let members = extract_workspace_members(&doc);
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn extract_workspace_members_empty_when_no_members_key() {
+        let doc: toml::Value = r#"
+            [workspace]
+            resolver = "2"
+        "#
+        .parse()
+        .unwrap();
+        let members = extract_workspace_members(&doc);
+        assert!(members.is_empty());
     }
 }
