@@ -6,13 +6,7 @@
 
 > "If I bump crates A, B and C in this Rust project - what else do I need to bump and how?"
 
-It will help you to ensure that changes in multi-repo Rust workspaces don't violate SemVer rules.  
-
-## Current State
-
-⚠️ This project is under active development, and may change its behavior drastically over time. ⚠️
-
-Feel free to contribute, ask questions and propose new features.
+You could think of it as propagating **version waves** through your workspace.
 
 ## Motivation
 
