@@ -103,6 +103,7 @@ fn main() -> Result<()> {
         tree: cli.tree,
     };
 
+    let is_direct = cli.direct.is_some();
     let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = cli.direct {
         let seeds: HashSet<String> = direct_crates.into_iter().collect();
         println!(
@@ -200,6 +201,21 @@ fn main() -> Result<()> {
             .map(|p| (p.name.to_string(), p.version.clone()))
             .collect(),
     };
+
+    if is_direct {
+        let all_known: HashSet<&str> = metadata.packages.iter().map(|p| p.name.as_str()).collect();
+        let unknown: Vec<&str> = all_seeds
+            .iter()
+            .filter(|s| !all_known.contains(s.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "Unknown crate(s) passed to --direct: {}",
+                unknown.join(", ")
+            );
+        }
+    }
 
     let mut pending_nodes: Vec<&Node> = resolve
         .nodes

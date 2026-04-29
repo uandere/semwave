@@ -28,7 +28,7 @@ Identifying manually whether a crate depends in a breaking or a non-breaking way
 
 ...and many more!
 
-As if that wasn't enough, you need to perform those checks on **every single crate that got any of its dependency version updated** in the workspace. Large workspaces have deep dependency graphs, re-exports that hide where a type actually comes from, and version schemes that change the meaning of each bump level. All that makes it nearly *impossible* to manually determine what needs a version bump and how big. `semwave` automates that analysis so you don't have to.
+As if that wasn't enough, you need to perform those checks on **every single crate that got any of its dependency versions updated** in the workspace. Large workspaces have deep dependency graphs, re-exports that hide where a type actually comes from, and version schemes that change the meaning of each bump level. All that makes it nearly *impossible* to manually determine what needs a version bump and how big. `semwave` automates that analysis so you don't have to.
 
 ## How Does It Work?
 
@@ -73,21 +73,31 @@ flowchart LR
 - **Requires a nightly toolchain** - rustdoc JSON output is a nightly-only feature.
 - **Type-level only** - `semwave` detects leaked *definitions*, not behavioral changes. If a dependency silently changes the semantics of a function without altering its signature, the tool won't flag it.
 - **Complex version requirements are unsupported** - ranges (`>=1.2, <2`), wildcards (`1.*`), and multi-constraint specs are skipped during seed detection.
-- **Cargo projects only** - the tool is purpose-built for Rust/Cargo. It won't help with polyglot monorepos or non-Cargo Rust projects.
+- **Cargo projects only** - the tool is purpose-built for Rust/Cargo. It won't help with non-Cargo Rust projects.
 - **Rustdoc failures are handled conservatively** - if a crate fails to generate rustdoc JSON (e.g., due to nightly failing to build non-nightly code or missing features), `semwave` assumes the worst-case bump and prints a warning, which can lead to over-bumping. This is a safe choice, as it prevents false negatives, but it also means that you need to do some manual work sometimes. 
 
 ## Installation
+
+First, you will need a nightly toolchain installed, since `rustdoc` JSON output is a nightly-only feature:
+
+```sh
+rustup toolchain install nightly
+```
+
+Then, proceed to one of the following options.
+
+### crates.io
+
+```sh
+cargo install semwave
+```
+
+### GitHub
 
 ```sh
 git clone git@github.com:uandere/semwave.git
 cd semwave
 cargo install --path .
-```
-
-You'll also need a nightly toolchain installed, since rustdoc JSON output is a nightly-only feature:
-
-```sh
-rustup toolchain install nightly
 ```
 
 ## Usage
@@ -116,7 +126,7 @@ Options:
 
 ### Why not just use `cargo-semver-checks` / `release-plz`?
 
-Those tools answer a different question. `cargo-semver-checks` tells you whether a **single crate's** public API changed in a breaking way. `release-plz` automates the release workflow for **individual crates**. Neither of them propagates bumps: if crate A gets a breaking change and crate B re-exports a type from A, those tools won't tell you that B also needs a bump. `semwave` exists specifically for that transitive propagation problem.
+Those tools answer a different question. `cargo-semver-checks` tells you whether a **single crate's public API changed in a breaking way**. `release-plz` automates the release workflow for **individual crates**. Neither of them propagates bumps: if crate A gets a breaking change and crate B re-exports a type from A, those tools won't tell you that B also needs a bump. `semwave` exists specifically for that transitive propagation problem.
 
 ### Does `semwave` detect breaking API changes itself?
 
