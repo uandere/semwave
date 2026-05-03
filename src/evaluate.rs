@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     leak::find_leaked_deps,
+    report::{Event, EventSink, LeakDetail},
     semver::{Bump, ChangeKind, required_bump},
 };
 use anyhow::{Context, Result};
 use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
-use colored::Colorize as _;
 use semver::Version;
 
 /// Returns true if this dependency edge includes a Normal (non-dev, non-build)
@@ -74,6 +74,7 @@ pub fn evaluate_crate_bump(
     ctx: &WorkspaceContext,
     state: &mut WaveState,
     opts: &AnalysisOptions,
+    sink: &dyn EventSink,
 ) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
     let node_name = &ctx.pkg_names[&node.id];
     let node_version = ctx.pkg_versions.get(node_name);
@@ -94,11 +95,7 @@ pub fn evaluate_crate_bump(
         if !opts.include_binaries {
             return Ok((ChangeKind::None, Bump::None, vec![]));
         }
-        println!(
-            "  {} {} is binary-only, no public API to leak",
-            "->".dimmed(),
-            node_name.cyan()
-        );
+        sink.emit(&Event::BinaryCrateSkipped { name: node_name });
         let bump = node_version
             .map(|v| required_bump(v, ChangeKind::Patch))
             .unwrap_or(Bump::Patch);
@@ -112,11 +109,10 @@ pub fn evaluate_crate_bump(
         return Ok((ChangeKind::Patch, bump, influences));
     }
 
-    println!(
-        "Analyzing {} for public API exposure of {:?}",
-        node_name.cyan().bold(),
-        dep_names
-    );
+    sink.emit(&Event::AnalyzingCrate {
+        name: node_name,
+        deps: &dep_names,
+    });
 
     let manifest = ctx
         .pkg_manifest_paths
@@ -141,14 +137,11 @@ pub fn evaluate_crate_bump(
             let conservative_bump = node_version
                 .map(|v| required_bump(v, worst_change))
                 .unwrap_or(Bump::Minor);
-            eprintln!(
-                "  {} rustdoc JSON generation failed for {}: {}\n  \
-                 Conservatively assuming {} bump.",
-                "WARNING:".yellow().bold(),
-                node_name.cyan(),
-                e,
-                conservative_bump
-            );
+            sink.emit(&Event::RustdocFailed {
+                crate_name: node_name,
+                error: &e.to_string(),
+                conservative_bump,
+            });
             state.failed.insert(node_name.to_owned());
             let influences = affected_deps
                 .into_iter()
@@ -191,33 +184,26 @@ pub fn evaluate_crate_bump(
             let edge_bump = node_version
                 .map(|v| required_bump(v, dep_change))
                 .unwrap_or(Bump::Minor);
-            println!(
-                "  {} {} leaks {} ({}):",
-                "->".red().bold(),
-                node_name.red().bold(),
-                dep_name.yellow(),
-                edge_bump
-            );
-            if opts.verbose {
-                for (leaked_name, details) in &leaked {
-                    if leaked_name.replace('-', "_") == dep_norm {
-                        for detail in details {
-                            let types_str = detail
-                                .leaked_types
-                                .iter()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            println!(
-                                "     {} {} — uses {}",
-                                detail.item_kind.dimmed(),
-                                detail.item_name.dimmed(),
-                                types_str.dimmed()
-                            );
-                        }
-                    }
-                }
-            }
+            let details: Vec<LeakDetail> = if opts.verbose {
+                leaked
+                    .iter()
+                    .filter(|(leaked_name, _)| leaked_name.replace('-', "_") == dep_norm)
+                    .flat_map(|(_, items)| items.iter())
+                    .map(|detail| LeakDetail {
+                        item_kind: detail.item_kind.to_string(),
+                        item_name: detail.item_name.clone(),
+                        leaked_types: detail.leaked_types.iter().cloned().collect(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            sink.emit(&Event::LeakDetected {
+                crate_name: node_name,
+                dep: dep_name,
+                bump: edge_bump,
+                details: &details,
+            });
             influences.push(DepInfluence {
                 dep_name: dep_name.to_owned(),
                 bump: edge_bump,

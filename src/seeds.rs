@@ -5,9 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use colored::Colorize as _;
 use semver::Version;
 
+use crate::report::{BumpSource, Event, EventSink};
 use crate::semver::{Bump, ChangeKind, classify_version_change, required_bump};
 
 /// Result of scanning git diffs for version changes.
@@ -19,7 +19,11 @@ pub struct VersionChanges {
     pub new_crates: HashSet<String>,
 }
 
-pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChanges> {
+pub fn detect_version_changes(
+    source: &str,
+    target: &str,
+    sink: &dyn EventSink,
+) -> Result<VersionChanges> {
     let base = merge_base(source, target)?;
     let changed_files = get_changed_cargo_tomls(&base, target)?;
 
@@ -28,10 +32,10 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
     let mut local_bumps: HashMap<String, Bump> = HashMap::new();
     let mut new_crates: HashSet<String> = HashSet::new();
 
-    println!("{}", "Detected version changes:".bold());
+    sink.emit(&Event::DetectedChangesHeader);
 
     for file in &changed_files {
-        let (old_toml, new_toml) = match get_toml_file_change(&base, target, file) {
+        let (old_toml, new_toml) = match get_toml_file_change(&base, target, file, sink) {
             Some(TomlFileChange::Added { name }) => {
                 if let Some(name) = name {
                     new_crates.insert(name);
@@ -62,26 +66,22 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
             match change {
                 ChangeKind::Breaking => {
                     if breaking_seeds.insert(name.clone()) {
-                        println!(
-                            "  {} {}: {} -> {} {}",
-                            "[dep]".dimmed(),
-                            name.cyan(),
-                            old_ver_str.dimmed(),
-                            new_ver_str.white().bold(),
-                            "(BREAKING)".red().bold()
-                        );
+                        sink.emit(&Event::DepVersionChanged {
+                            name,
+                            old: old_ver_str,
+                            new: new_ver_str,
+                            kind: ChangeKind::Breaking,
+                        });
                     }
                 }
                 ChangeKind::Additive => {
                     if !breaking_seeds.contains(name) && additive_seeds.insert(name.clone()) {
-                        println!(
-                            "  {} {}: {} -> {} {}",
-                            "[dep]".dimmed(),
-                            name.cyan(),
-                            old_ver_str.dimmed(),
-                            new_ver_str.white().bold(),
-                            "(ADDITIVE)".yellow().bold()
-                        );
+                        sink.emit(&Event::DepVersionChanged {
+                            name,
+                            old: old_ver_str,
+                            new: new_ver_str,
+                            kind: ChangeKind::Additive,
+                        });
                     }
                 }
                 _ => {}
@@ -98,10 +98,11 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
                 name,
                 &ov,
                 &nv,
-                "",
+                BumpSource::Package,
                 &mut breaking_seeds,
                 &mut additive_seeds,
                 &mut local_bumps,
+                sink,
             );
         }
 
@@ -114,10 +115,9 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
             let workspace_dir = Path::new(file).parent().unwrap_or(Path::new(""));
             for member_rel in extract_workspace_members(&new_toml) {
                 if member_rel.contains('*') {
-                    eprintln!(
-                        "Warning: skipping glob workspace member '{}' for version inheritance",
-                        member_rel
-                    );
+                    sink.emit(&Event::GlobMemberSkipped {
+                        member: &member_rel,
+                    });
                     continue;
                 }
                 let member_toml = if workspace_dir == Path::new("") {
@@ -151,10 +151,11 @@ pub fn detect_version_changes(source: &str, target: &str) -> Result<VersionChang
                         name,
                         &old_ws_ver,
                         &new_ws_ver,
-                        "[workspace]",
+                        BumpSource::Workspace,
                         &mut breaking_seeds,
                         &mut additive_seeds,
                         &mut local_bumps,
+                        sink,
                     );
                 }
             }
@@ -180,7 +181,12 @@ enum TomlFileChange {
     },
 }
 
-fn get_toml_file_change(base: &str, target: &str, filename: &str) -> Option<TomlFileChange> {
+fn get_toml_file_change(
+    base: &str,
+    target: &str,
+    filename: &str,
+    sink: &dyn EventSink,
+) -> Option<TomlFileChange> {
     let old_toml = read_toml_at_ref(base, filename);
     let new_toml = read_toml_at_ref(target, filename);
 
@@ -188,12 +194,7 @@ fn get_toml_file_change(base: &str, target: &str, filename: &str) -> Option<Toml
         (Ok(o), Ok(n)) => (o, n),
         (Err(_), Ok(n)) => {
             let name = if let Ok((name, _)) = extract_package_version(&n, target, filename) {
-                println!(
-                    "  {} {} {}",
-                    "[new]".dimmed(),
-                    name.cyan(),
-                    "(NEW CRATE)".green().bold()
-                );
+                sink.emit(&Event::NewCrate { name: &name });
                 Some(name)
             } else {
                 None
@@ -202,12 +203,7 @@ fn get_toml_file_change(base: &str, target: &str, filename: &str) -> Option<Toml
         }
         (Ok(o), Err(_)) => {
             if let Ok((name, _)) = extract_package_version(&o, base, filename) {
-                println!(
-                    "  {} {} {}",
-                    "[removed]".dimmed(),
-                    name.cyan(),
-                    "(REMOVED)".red().bold()
-                );
+                sink.emit(&Event::RemovedCrate { name: &name });
             }
             return Some(TomlFileChange::Removed);
         }
@@ -396,43 +392,29 @@ fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Versio
     }
 }
 
-fn change_kind_label(change: ChangeKind) -> Option<String> {
-    match change {
-        ChangeKind::Breaking => Some("(BREAKING)".red().bold().to_string()),
-        ChangeKind::Additive => Some("(ADDITIVE)".yellow().bold().to_string()),
-        ChangeKind::Patch => Some("(PATCH)".green().to_string()),
-        ChangeKind::None => None,
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn record_local_bump(
     name: String,
     ov: &Version,
     nv: &Version,
-    context: &str,
+    source: BumpSource,
     breaking_seeds: &mut HashSet<String>,
     additive_seeds: &mut HashSet<String>,
     local_bumps: &mut HashMap<String, Bump>,
+    sink: &dyn EventSink,
 ) {
     let change = classify_version_change(ov, nv);
-    let Some(label) = change_kind_label(change) else {
+    if matches!(change, ChangeKind::None) {
         return;
-    };
+    }
     let bump = required_bump(ov, change);
-    let suffix = if context.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", context.dimmed())
-    };
-    println!(
-        "  {} {}: {} -> {} {}{}",
-        "[local]".dimmed(),
-        name.cyan(),
-        ov.to_string().dimmed(),
-        nv.to_string().white().bold(),
-        label,
-        suffix,
-    );
+    sink.emit(&Event::LocalPackageBump {
+        name: &name,
+        old: ov,
+        new: nv,
+        kind: change,
+        source,
+    });
     match change {
         ChangeKind::Breaking => {
             breaking_seeds.insert(name.clone());

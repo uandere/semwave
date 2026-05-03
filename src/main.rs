@@ -31,6 +31,8 @@ mod display;
 mod evaluate;
 /// Leak handling.
 mod leak;
+/// Structured event reporting.
+mod report;
 /// Seed detection & management.
 mod seeds;
 /// Semver helpers.
@@ -41,16 +43,17 @@ mod run;
 use anyhow::Result;
 use clap::Parser;
 
+use crate::report::StreamSink;
+
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
-    if cli.no_color {
-        colored::control::set_override(false);
-    }
+    let choice = if cli.no_color {
+        anstream::ColorChoice::Never
+    } else {
+        anstream::ColorChoice::Auto
+    };
+    let sink = StreamSink::new(choice);
 
-    if run::run(cli).is_err() {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    run::run(cli, &sink)
 }

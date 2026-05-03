@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use cargo_metadata::{CargoOpt, MetadataCommand, Node, PackageId};
-use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 
 use crate::cli::Cli;
@@ -8,10 +7,11 @@ use crate::display::print_influence_tree;
 use crate::evaluate::{
     AnalysisOptions, WaveState, WorkspaceContext, evaluate_crate_bump, is_normal_dep,
 };
+use crate::report::{Event, EventSink};
 use crate::seeds::detect_version_changes;
-use crate::semver::{Bump, ChangeKind, format_name_set, required_bump};
+use crate::semver::{Bump, ChangeKind, required_bump};
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
     let opts = AnalysisOptions {
         verbose: cli.verbose,
         rustdoc_stderr: cli.rustdoc_stderr,
@@ -23,11 +23,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let is_direct = cli.direct.is_some();
     let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = cli.direct {
         let seeds: HashSet<String> = direct_crates.into_iter().collect();
-        println!(
-            "{} assuming BREAKING change for {}\n",
-            "Direct mode:".bold(),
-            format_name_set(&seeds).cyan()
-        );
+        sink.emit(&Event::DirectModeBanner { seeds: &seeds });
         let wave = WaveState {
             breaking_crates: seeds.clone(),
             additive_crates: HashSet::new(),
@@ -35,34 +31,26 @@ pub fn run(cli: Cli) -> Result<()> {
         };
         (seeds, wave, HashMap::new(), HashSet::new())
     } else {
-        println!(
-            "Comparing versions between {} and {}...\n",
-            cli.source.cyan().bold(),
-            cli.target.cyan().bold()
-        );
-        let changes = detect_version_changes(&cli.source, &cli.target)?;
+        sink.emit(&Event::ComparingRefs {
+            source: &cli.source,
+            target: &cli.target,
+        });
+        let changes = detect_version_changes(&cli.source, &cli.target, sink)?;
 
         if changes.breaking_seeds.is_empty() && changes.additive_seeds.is_empty() {
-            println!(
-                "{}",
-                "No breaking/additive version changes detected. Nothing to propagate.".green()
-            );
+            sink.emit(&Event::NoChangesDetected);
             return Ok(());
         }
 
         if !changes.breaking_seeds.is_empty() {
-            println!(
-                "\n{} {}\n",
-                "Breaking seeds:".bold(),
-                format_name_set(&changes.breaking_seeds).red()
-            );
+            sink.emit(&Event::BreakingSeeds {
+                names: &changes.breaking_seeds,
+            });
         }
         if !changes.additive_seeds.is_empty() {
-            println!(
-                "{} {}\n",
-                "Additive seeds:".bold(),
-                format_name_set(&changes.additive_seeds).yellow()
-            );
+            sink.emit(&Event::AdditiveSeeds {
+                names: &changes.additive_seeds,
+            });
         }
 
         let all_seeds: HashSet<String> = changes
@@ -161,7 +149,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
             if deps_ready {
                 let (change_kind, _bump, influences) =
-                    evaluate_crate_bump(node, &ctx, &mut state, &opts)?;
+                    evaluate_crate_bump(node, &ctx, &mut state, &opts, sink)?;
 
                 for inf in &influences {
                     tree_edges
@@ -266,41 +254,28 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     if cli.tree {
-        println!("\n{}", "=== Influence Tree ===".bold().green());
-        print_influence_tree(&all_seeds, &tree_edges);
-        println!();
+        sink.emit(&Event::InfluenceTreeHeader);
+        print_influence_tree(&all_seeds, &tree_edges, sink);
     }
 
-    println!("{}", "=== Analysis Complete ===".bold().green());
-    println!(
-        "{} {}",
-        "MAJOR-bump list (Requires MAJOR bump / ↑.0.0):"
-            .red()
-            .bold(),
-        format_name_set(&major_list)
-    );
-    println!(
-        "{} {}",
-        "MINOR-bump list (Requires MINOR bump / x.↑.0):"
-            .yellow()
-            .bold(),
-        format_name_set(&minor_list)
-    );
-    println!(
-        "{} {}",
-        "PATCH-bump list (Requires PATCH bump / x.y.↑):"
-            .cyan()
-            .bold(),
-        format_name_set(&patch_list)
-    );
+    sink.emit(&Event::AnalysisCompleteHeader);
+    sink.emit(&Event::BumpList {
+        level: Bump::Major,
+        names: &major_list,
+    });
+    sink.emit(&Event::BumpList {
+        level: Bump::Minor,
+        names: &minor_list,
+    });
+    sink.emit(&Event::BumpList {
+        level: Bump::Patch,
+        names: &patch_list,
+    });
 
     if !state.failed.is_empty() {
-        eprintln!(
-            "\n{} The following crates failed rustdoc JSON generation \
-             and were conservatively assumed breaking. Verify manually:\n  {}",
-            "WARNING:".yellow().bold(),
-            format_name_set(&state.failed)
-        );
+        sink.emit(&Event::FailedRustdocSummary {
+            names: &state.failed,
+        });
     }
 
     let all_required: HashMap<&String, Bump> = major_list
@@ -312,56 +287,41 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let mut has_errors = false;
 
-    let under_bumped: Vec<(&String, Bump, &Bump)> = all_required
+    let under_bumped: Vec<(&str, Bump, Bump)> = all_required
         .iter()
         .filter(|(name, _)| !state.failed.contains(**name))
         .filter_map(|(name, required)| {
             local_bumps
                 .get(*name)
                 .filter(|local| local < &required)
-                .map(|local| (*name, *required, local))
+                .map(|local| (name.as_str(), *required, *local))
         })
         .collect();
     if !under_bumped.is_empty() {
         has_errors = true;
-        eprintln!(
-            "\n{} These crates have insufficient version bumps:",
-            "ERROR:".red().bold()
-        );
-        for (name, required, local) in &under_bumped {
-            eprintln!(
-                "  {} has {} bump but requires {}",
-                name.cyan(),
-                local,
-                required
-            );
-        }
+        sink.emit(&Event::UnderBumped {
+            items: &under_bumped,
+        });
     }
 
     if !local_bumps.is_empty() {
-        let missing: Vec<(&String, &Bump)> = all_required
+        let missing: Vec<(&str, Bump)> = all_required
             .iter()
             .filter(|(name, _)| {
                 !local_bumps.contains_key(**name)
                     && !state.failed.contains(**name)
                     && !new_crates.contains(**name)
             })
-            .map(|(name, bump)| (*name, bump))
+            .map(|(name, bump)| (name.as_str(), *bump))
             .collect();
         if !missing.is_empty() {
             has_errors = true;
-            eprintln!(
-                "\n{} These crates need a version bump but have none:",
-                "ERROR:".red().bold()
-            );
-            for (name, required) in &missing {
-                eprintln!("  {} requires {}", name.cyan(), required);
-            }
+            sink.emit(&Event::MissingBumps { items: &missing });
         }
     }
 
-    if !has_errors {
-        return Err(anyhow!("`semwave` had encountered errors during analysis"));
+    if has_errors {
+        return Err(anyhow!("semwave encountered errors during analysis"));
     }
 
     Ok(())
