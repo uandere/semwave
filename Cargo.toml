@@ -10,10 +10,11 @@ keywords = ["semver", "versioning", "cargo", "static-analysis", "breaking-change
 categories = ["development-tools::cargo-plugins"]
 
 [dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
 anyhow = "1.0.102"
 cargo_metadata = "0.23.1"
 clap = { version = "4.5.60", features = ["derive"] }
-colored = "3"
 rustdoc-json = "0.9.8"
 rustdoc-types = "0.57.0"
 semver = "1"
