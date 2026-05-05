@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "semwave"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anstream 1.0.0",
  "anstyle",
