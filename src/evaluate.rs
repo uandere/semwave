@@ -72,7 +72,7 @@ pub fn evaluate_crate_bump(
     let node_name = &ctx.pkg_names[&node.id];
     let node_version = ctx.pkg_versions.get(node_name);
 
-    if !cli.tree && state.breaking_crates.contains(node_name.as_str()) {
+    if !cli.tree && state.breaking_crates.contains(node_name) {
         return Ok((ChangeKind::None, Bump::None, vec![]));
     }
 
@@ -175,8 +175,7 @@ pub fn evaluate_crate_bump(
     let mut influences = Vec::new();
 
     for (dep_name, dep_change) in affected_deps {
-        let dep_name = dep_name.as_str();
-        let dep_norm = dep_name.replace('-', "_");
+        let dep_norm = dep_name.as_str().replace('-', "_");
         let is_leaked = leaked.keys().any(|k| k.replace('-', "_") == dep_norm);
 
         if is_leaked {
@@ -199,18 +198,18 @@ pub fn evaluate_crate_bump(
             };
             sink.emit(&Event::LeakDetected {
                 crate_name: node_name.as_str(),
-                dep: dep_name,
+                dep: dep_name.as_str(),
                 bump: edge_bump,
                 details: &details,
             });
             influences.push(DepInfluence {
-                dep_name: CrateName::from(dep_name),
+                dep_name: dep_name.clone(),
                 bump: edge_bump,
             });
             worst_change = worst_change.max(dep_change);
         } else {
             influences.push(DepInfluence {
-                dep_name: CrateName::from(dep_name),
+                dep_name: dep_name.clone(),
                 bump: Bump::Patch,
             });
         }
