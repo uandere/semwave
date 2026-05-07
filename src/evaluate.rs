@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    cli::Cli,
     leak::find_leaked_deps,
     report::{Event, EventSink, LeakDetail},
     semver::{Bump, ChangeKind, required_bump},
+    types::{CrateName, ManifestPath},
 };
 use anyhow::{Context, Result};
 use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
@@ -19,32 +21,23 @@ pub fn is_normal_dep(dep: &NodeDep) -> bool {
 
 /// Shared read-only context about the workspace, built once from `cargo metadata`.
 pub struct WorkspaceContext {
-    pub pkg_names: HashMap<PackageId, String>,
-    pub pkg_manifest_paths: HashMap<String, String>,
-    pub pkg_has_lib: HashSet<String>,
-    pub pkg_versions: HashMap<String, Version>,
+    pub pkg_names: HashMap<PackageId, CrateName>,
+    pub pkg_manifest_paths: HashMap<CrateName, ManifestPath>,
+    pub pkg_has_lib: HashSet<CrateName>,
+    pub pkg_versions: HashMap<CrateName, Version>,
 }
 
 /// Mutable state accumulated during the propagation wave.
 pub struct WaveState {
-    pub breaking_crates: HashSet<String>,
-    pub additive_crates: HashSet<String>,
-    pub failed: HashSet<String>,
-}
-
-/// Per-crate analysis options.
-pub struct AnalysisOptions {
-    pub verbose: bool,
-    pub rustdoc_stderr: bool,
-    pub toolchain: String,
-    pub include_binaries: bool,
-    pub tree: bool,
+    pub breaking_crates: HashSet<CrateName>,
+    pub additive_crates: HashSet<CrateName>,
+    pub failed: HashSet<CrateName>,
 }
 
 /// Per-dependency influence: which dep caused the bump and how.
 #[derive(Debug, Clone)]
 pub struct DepInfluence {
-    pub dep_name: String,
+    pub dep_name: CrateName,
     pub bump: Bump,
 }
 
@@ -52,12 +45,12 @@ pub fn evaluate_affected_deps<'a>(
     node: &Node,
     ctx: &'a WorkspaceContext,
     state: &mut WaveState,
-) -> Vec<(&'a str, ChangeKind)> {
+) -> Vec<(&'a CrateName, ChangeKind)> {
     node.deps
         .iter()
-        .filter(|d| d.pkg != node.id && is_normal_dep(d))
-        .filter_map(|d| {
-            let name = ctx.pkg_names[&d.pkg].as_str();
+        .filter(|dep| dep.pkg != node.id && is_normal_dep(dep))
+        .filter_map(|dep| {
+            let name = &ctx.pkg_names[&dep.pkg];
             if state.breaking_crates.contains(name) {
                 Some((name, ChangeKind::Breaking))
             } else if state.additive_crates.contains(name) {
@@ -73,13 +66,13 @@ pub fn evaluate_crate_bump(
     node: &Node,
     ctx: &WorkspaceContext,
     state: &mut WaveState,
-    opts: &AnalysisOptions,
+    cli: &Cli,
     sink: &dyn EventSink,
 ) -> Result<(ChangeKind, Bump, Vec<DepInfluence>)> {
     let node_name = &ctx.pkg_names[&node.id];
     let node_version = ctx.pkg_versions.get(node_name);
 
-    if !opts.tree && state.breaking_crates.contains(node_name.as_str()) {
+    if !cli.tree && state.breaking_crates.contains(node_name.as_str()) {
         return Ok((ChangeKind::None, Bump::None, vec![]));
     }
 
@@ -89,20 +82,25 @@ pub fn evaluate_crate_bump(
         return Ok((ChangeKind::None, Bump::None, vec![]));
     }
 
-    let dep_names: Vec<&str> = affected_deps.iter().map(|(n, _)| *n).collect();
+    let dep_names: Vec<&str> = affected_deps
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
 
     if !ctx.pkg_has_lib.contains(node_name) {
-        if !opts.include_binaries {
+        if !cli.include_binaries {
             return Ok((ChangeKind::None, Bump::None, vec![]));
         }
-        sink.emit(&Event::BinaryCrateSkipped { name: node_name });
+        sink.emit(&Event::BinaryCrateSkipped {
+            name: node_name.as_str(),
+        });
         let bump = node_version
-            .map(|v| required_bump(v, ChangeKind::Patch))
+            .map(|version| required_bump(version, ChangeKind::Patch))
             .unwrap_or(Bump::Patch);
         let influences = affected_deps
             .into_iter()
             .map(|(dep_name, _)| DepInfluence {
-                dep_name: dep_name.to_owned(),
+                dep_name: dep_name.clone(),
                 bump: Bump::Patch,
             })
             .collect();
@@ -110,7 +108,7 @@ pub fn evaluate_crate_bump(
     }
 
     sink.emit(&Event::AnalyzingCrate {
-        name: node_name,
+        name: node_name.as_str(),
         deps: &dep_names,
     });
 
@@ -120,33 +118,33 @@ pub fn evaluate_crate_bump(
         .with_context(|| format!("No manifest path for {}", node_name))?;
 
     let json_path = match rustdoc_json::Builder::default()
-        .toolchain(&opts.toolchain)
-        .manifest_path(manifest)
+        .toolchain(cli.toolchain.as_str())
+        .manifest_path(manifest.as_str())
         .all_features(true)
         .cap_lints(Some("allow"))
-        .silent(!opts.rustdoc_stderr)
+        .silent(!cli.rustdoc_stderr)
         .build()
     {
         Ok(path) => path,
         Err(e) => {
             let worst_change = affected_deps
                 .iter()
-                .map(|(_, ck)| *ck)
+                .map(|(_, change)| *change)
                 .max()
                 .unwrap_or(ChangeKind::Breaking);
             let conservative_bump = node_version
-                .map(|v| required_bump(v, worst_change))
+                .map(|version| required_bump(version, worst_change))
                 .unwrap_or(Bump::Minor);
             sink.emit(&Event::RustdocFailed {
-                crate_name: node_name,
+                crate_name: node_name.as_str(),
                 error: &e.to_string(),
                 conservative_bump,
             });
-            state.failed.insert(node_name.to_owned());
+            state.failed.insert(node_name.clone());
             let influences = affected_deps
                 .into_iter()
                 .map(|(dep_name, _)| DepInfluence {
-                    dep_name: dep_name.to_owned(),
+                    dep_name: dep_name.clone(),
                     bump: conservative_bump,
                 })
                 .collect();
@@ -161,7 +159,7 @@ pub fn evaluate_crate_bump(
 
     let dep_norm_set: HashSet<String> = affected_deps
         .iter()
-        .map(|(n, _)| n.replace('-', "_"))
+        .map(|(name, _)| name.as_str().replace('-', "_"))
         .collect();
 
     let dep_crate_id_to_name: HashMap<u32, String> = krate
@@ -177,14 +175,15 @@ pub fn evaluate_crate_bump(
     let mut influences = Vec::new();
 
     for (dep_name, dep_change) in affected_deps {
+        let dep_name = dep_name.as_str();
         let dep_norm = dep_name.replace('-', "_");
         let is_leaked = leaked.keys().any(|k| k.replace('-', "_") == dep_norm);
 
         if is_leaked {
             let edge_bump = node_version
-                .map(|v| required_bump(v, dep_change))
+                .map(|version| required_bump(version, dep_change))
                 .unwrap_or(Bump::Minor);
-            let details: Vec<LeakDetail> = if opts.verbose {
+            let details: Vec<LeakDetail> = if cli.verbose {
                 leaked
                     .iter()
                     .filter(|(leaked_name, _)| leaked_name.replace('-', "_") == dep_norm)
@@ -199,26 +198,26 @@ pub fn evaluate_crate_bump(
                 Vec::new()
             };
             sink.emit(&Event::LeakDetected {
-                crate_name: node_name,
+                crate_name: node_name.as_str(),
                 dep: dep_name,
                 bump: edge_bump,
                 details: &details,
             });
             influences.push(DepInfluence {
-                dep_name: dep_name.to_owned(),
+                dep_name: CrateName::from(dep_name),
                 bump: edge_bump,
             });
             worst_change = worst_change.max(dep_change);
         } else {
             influences.push(DepInfluence {
-                dep_name: dep_name.to_owned(),
+                dep_name: CrateName::from(dep_name),
                 bump: Bump::Patch,
             });
         }
     }
 
     let final_bump = node_version
-        .map(|v| required_bump(v, worst_change))
+        .map(|version| required_bump(version, worst_change))
         .unwrap_or(Bump::Patch);
 
     Ok((worst_change, final_bump, influences))

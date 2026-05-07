@@ -2,6 +2,8 @@ use std::fmt;
 
 use semver::Version;
 
+use crate::types::CrateName;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Bump {
     None,
@@ -87,15 +89,15 @@ pub fn required_bump(version: &Version, change: ChangeKind) -> Bump {
     }
 }
 
-/// Format a set of strings as `{"a", "b", "c"}` for user-facing output.
-pub fn format_name_set<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
-    let mut sorted: Vec<&str> = names.into_iter().map(|s| s.as_str()).collect();
+/// Format a set of crate names as `{"a", "b", "c"}` for user-facing output.
+pub fn format_name_set<'a>(names: impl IntoIterator<Item = &'a CrateName>) -> String {
+    let mut sorted: Vec<&str> = names.into_iter().map(|name| name.as_str()).collect();
     sorted.sort_unstable();
     format!(
         "{{{}}}",
         sorted
             .iter()
-            .map(|s| format!("\"{}\"", s))
+            .map(|name| format!("\"{}\"", name))
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -224,22 +226,22 @@ mod tests {
 
     #[test]
     fn format_name_set_empty() {
-        let empty: Vec<String> = vec![];
+        let empty: Vec<CrateName> = vec![];
         assert_eq!(format_name_set(&empty), "{}");
     }
 
     #[test]
     fn format_name_set_single() {
-        let names = vec!["foo".to_string()];
+        let names = vec![CrateName::from("foo")];
         assert_eq!(format_name_set(&names), "{\"foo\"}");
     }
 
     #[test]
     fn format_name_set_multiple_sorted() {
         let names = vec![
-            "charlie".to_string(),
-            "alpha".to_string(),
-            "bravo".to_string(),
+            CrateName::from("charlie"),
+            CrateName::from("alpha"),
+            CrateName::from("bravo"),
         ];
         assert_eq!(
             format_name_set(&names),

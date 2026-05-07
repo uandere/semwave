@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use semver::Version;
 
 use crate::semver::{Bump, ChangeKind};
+use crate::types::{CrateName, MissingBumpItem, UnderBumpedItem};
 
 /// Where a local package version bump came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub enum TreeNodeKind {
 pub struct TreeNode {
     pub depth: usize,
     pub is_last_sibling: bool,
-    pub name: String,
+    pub name: CrateName,
     pub kind: TreeNodeKind,
 }
 
@@ -39,7 +40,7 @@ pub struct TreeNode {
 #[derive(Debug)]
 pub enum Event<'a> {
     DirectModeBanner {
-        seeds: &'a HashSet<String>,
+        seeds: &'a HashSet<CrateName>,
     },
     ComparingRefs {
         source: &'a str,
@@ -70,10 +71,10 @@ pub enum Event<'a> {
         member: &'a str,
     },
     BreakingSeeds {
-        names: &'a HashSet<String>,
+        names: &'a HashSet<CrateName>,
     },
     AdditiveSeeds {
-        names: &'a HashSet<String>,
+        names: &'a HashSet<CrateName>,
     },
     AnalyzingCrate {
         name: &'a str,
@@ -100,15 +101,15 @@ pub enum Event<'a> {
     AnalysisCompleteHeader,
     BumpList {
         level: Bump,
-        names: &'a HashSet<String>,
+        names: &'a HashSet<CrateName>,
     },
     FailedRustdocSummary {
-        names: &'a HashSet<String>,
+        names: &'a HashSet<CrateName>,
     },
     UnderBumped {
-        items: &'a [(&'a str, Bump, Bump)],
+        items: &'a [UnderBumpedItem<'a>],
     },
     MissingBumps {
-        items: &'a [(&'a str, Bump)],
+        items: &'a [MissingBumpItem<'a>],
     },
 }

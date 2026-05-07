@@ -4,25 +4,19 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cli::Cli;
 use crate::display::print_influence_tree;
-use crate::evaluate::{
-    AnalysisOptions, WaveState, WorkspaceContext, evaluate_crate_bump, is_normal_dep,
-};
+use crate::evaluate::{WaveState, WorkspaceContext, evaluate_crate_bump, is_normal_dep};
 use crate::report::{Event, EventSink};
 use crate::seeds::detect_version_changes;
 use crate::semver::{Bump, ChangeKind, required_bump};
+use crate::types::{CrateName, ManifestPath, MissingBumpItem, TreeEdge, UnderBumpedItem};
 
-pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
-    let opts = AnalysisOptions {
-        verbose: cli.verbose,
-        rustdoc_stderr: cli.rustdoc_stderr,
-        toolchain: cli.toolchain,
-        include_binaries: cli.include_binaries,
-        tree: cli.tree,
-    };
-
+pub fn run(cli: &Cli, sink: &dyn EventSink) -> Result<()> {
     let is_direct = cli.direct.is_some();
-    let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = cli.direct {
-        let seeds: HashSet<String> = direct_crates.into_iter().collect();
+    let (all_seeds, mut state, local_bumps, new_crates) = if let Some(direct_crates) = &cli.direct {
+        let seeds: HashSet<CrateName> = direct_crates
+            .iter()
+            .map(|name| CrateName::from(name.as_str()))
+            .collect();
         sink.emit(&Event::DirectModeBanner { seeds: &seeds });
         let wave = WaveState {
             breaking_crates: seeds.clone(),
@@ -53,7 +47,7 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
             });
         }
 
-        let all_seeds: HashSet<String> = changes
+        let all_seeds: HashSet<CrateName> = changes
             .breaking_seeds
             .iter()
             .chain(changes.additive_seeds.iter())
@@ -68,8 +62,8 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         (all_seeds, wave, changes.local_bumps, changes.new_crates)
     };
 
-    let mut patch_crates: HashSet<String> = HashSet::new();
-    let mut tree_edges: HashMap<String, Vec<(String, Bump)>> = HashMap::new();
+    let mut patch_crates: HashSet<CrateName> = HashSet::new();
+    let mut tree_edges: HashMap<CrateName, Vec<TreeEdge>> = HashMap::new();
 
     let metadata = MetadataCommand::new()
         .features(CargoOpt::AllFeatures)
@@ -84,35 +78,48 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         pkg_names: metadata
             .packages
             .iter()
-            .map(|p| (p.id.clone(), p.name.to_string()))
+            .map(|pkg| (pkg.id.clone(), CrateName::from(pkg.name.to_string())))
             .collect(),
         pkg_manifest_paths: metadata
             .packages
             .iter()
-            .filter(|p| workspace_members.contains(&p.id))
-            .map(|p| (p.name.to_string(), p.manifest_path.to_string()))
+            .filter(|pkg| workspace_members.contains(&pkg.id))
+            .map(|pkg| {
+                (
+                    CrateName::from(pkg.name.to_string()),
+                    ManifestPath::from(pkg.manifest_path.to_string()),
+                )
+            })
             .collect(),
         pkg_has_lib: metadata
             .packages
             .iter()
-            .filter(|p| workspace_members.contains(&p.id))
-            .filter(|p| p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()))
-            .map(|p| p.name.to_string())
+            .filter(|pkg| workspace_members.contains(&pkg.id))
+            .filter(|pkg| {
+                pkg.targets
+                    .iter()
+                    .any(|target| target.is_lib() || target.is_proc_macro())
+            })
+            .map(|pkg| CrateName::from(pkg.name.to_string()))
             .collect(),
         pkg_versions: metadata
             .packages
             .iter()
-            .filter(|p| workspace_members.contains(&p.id))
-            .map(|p| (p.name.to_string(), p.version.clone()))
+            .filter(|pkg| workspace_members.contains(&pkg.id))
+            .map(|pkg| (CrateName::from(pkg.name.to_string()), pkg.version.clone()))
             .collect(),
     };
 
     if is_direct {
-        let all_known: HashSet<&str> = metadata.packages.iter().map(|p| p.name.as_str()).collect();
+        let all_known: HashSet<&str> = metadata
+            .packages
+            .iter()
+            .map(|pkg| pkg.name.as_str())
+            .collect();
         let unknown: Vec<&str> = all_seeds
             .iter()
-            .filter(|s| !all_known.contains(s.as_str()))
-            .map(|s| s.as_str())
+            .filter(|name| !all_known.contains(name.as_str()))
+            .map(|name| name.as_str())
             .collect();
         if !unknown.is_empty() {
             anyhow::bail!(
@@ -125,10 +132,10 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
     let mut pending_nodes: Vec<&Node> = resolve
         .nodes
         .iter()
-        .filter(|n| workspace_members.contains(&n.id))
+        .filter(|node| workspace_members.contains(&node.id))
         .collect();
 
-    let mut processed: HashSet<String> = HashSet::new();
+    let mut processed: HashSet<CrateName> = HashSet::new();
 
     while !pending_nodes.is_empty() {
         let mut made_progress = false;
@@ -137,25 +144,32 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
             let node = pending_nodes[i];
             let node_name = &ctx.pkg_names[&node.id];
 
-            let deps_ready = node.deps.iter().filter(|d| is_normal_dep(d)).all(|dep| {
-                if dep.pkg == node.id {
-                    true
-                } else if workspace_members.contains(&dep.pkg) {
-                    processed.contains(&ctx.pkg_names[&dep.pkg])
-                } else {
-                    true
-                }
-            });
+            let deps_ready = node
+                .deps
+                .iter()
+                .filter(|dep| is_normal_dep(dep))
+                .all(|dep| {
+                    if dep.pkg == node.id {
+                        true
+                    } else if workspace_members.contains(&dep.pkg) {
+                        processed.contains(&ctx.pkg_names[&dep.pkg])
+                    } else {
+                        true
+                    }
+                });
 
             if deps_ready {
                 let (change_kind, _bump, influences) =
-                    evaluate_crate_bump(node, &ctx, &mut state, &opts, sink)?;
+                    evaluate_crate_bump(node, &ctx, &mut state, cli, sink)?;
 
                 for inf in &influences {
                     tree_edges
                         .entry(inf.dep_name.clone())
                         .or_default()
-                        .push((node_name.clone(), inf.bump));
+                        .push(TreeEdge {
+                            child: node_name.clone(),
+                            bump: inf.bump,
+                        });
                 }
 
                 match change_kind {
@@ -180,7 +194,7 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         if !made_progress {
             let stuck: Vec<&str> = pending_nodes
                 .iter()
-                .map(|n| ctx.pkg_names[&n.id].as_str())
+                .map(|node| ctx.pkg_names[&node.id].as_str())
                 .collect();
             anyhow::bail!(
                 "Cannot make progress on crates: {:?}. \
@@ -217,15 +231,15 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         }
     }
 
-    let mut major_list: HashSet<String> = HashSet::new();
-    let mut minor_list: HashSet<String> = HashSet::new();
-    let mut patch_list: HashSet<String> = patch_crates;
+    let mut major_list: HashSet<CrateName> = HashSet::new();
+    let mut minor_list: HashSet<CrateName> = HashSet::new();
+    let mut patch_list: HashSet<CrateName> = patch_crates;
 
     for name in &state.breaking_crates {
         let bump = ctx
             .pkg_versions
             .get(name)
-            .map(|v| required_bump(v, ChangeKind::Breaking))
+            .map(|version| required_bump(version, ChangeKind::Breaking))
             .unwrap_or(Bump::Minor);
         match bump {
             Bump::Major => {
@@ -241,7 +255,7 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         let bump = ctx
             .pkg_versions
             .get(name)
-            .map(|v| required_bump(v, ChangeKind::Additive))
+            .map(|version| required_bump(version, ChangeKind::Additive))
             .unwrap_or(Bump::Patch);
         match bump {
             Bump::Minor => {
@@ -278,23 +292,27 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
         });
     }
 
-    let all_required: HashMap<&String, Bump> = major_list
+    let all_required: HashMap<&CrateName, Bump> = major_list
         .iter()
-        .map(|n| (n, Bump::Major))
-        .chain(minor_list.iter().map(|n| (n, Bump::Minor)))
-        .chain(patch_list.iter().map(|n| (n, Bump::Patch)))
+        .map(|name| (name, Bump::Major))
+        .chain(minor_list.iter().map(|name| (name, Bump::Minor)))
+        .chain(patch_list.iter().map(|name| (name, Bump::Patch)))
         .collect();
 
     let mut has_errors = false;
 
-    let under_bumped: Vec<(&str, Bump, Bump)> = all_required
+    let under_bumped: Vec<UnderBumpedItem> = all_required
         .iter()
         .filter(|(name, _)| !state.failed.contains(**name))
-        .filter_map(|(name, required)| {
+        .filter_map(|(&name, required)| {
             local_bumps
-                .get(*name)
+                .get(name)
                 .filter(|local| local < &required)
-                .map(|local| (name.as_str(), *required, *local))
+                .map(|local| UnderBumpedItem {
+                    name,
+                    required: *required,
+                    local: *local,
+                })
         })
         .collect();
     if !under_bumped.is_empty() {
@@ -305,14 +323,17 @@ pub fn run(cli: Cli, sink: &dyn EventSink) -> Result<()> {
     }
 
     if !local_bumps.is_empty() {
-        let missing: Vec<(&str, Bump)> = all_required
+        let missing: Vec<MissingBumpItem> = all_required
             .iter()
             .filter(|(name, _)| {
                 !local_bumps.contains_key(**name)
                     && !state.failed.contains(**name)
                     && !new_crates.contains(**name)
             })
-            .map(|(name, bump)| (name.as_str(), *bump))
+            .map(|(name, bump)| MissingBumpItem {
+                name,
+                required: *bump,
+            })
             .collect();
         if !missing.is_empty() {
             has_errors = true;

@@ -9,14 +9,15 @@ use semver::Version;
 
 use crate::report::{BumpSource, Event, EventSink};
 use crate::semver::{Bump, ChangeKind, classify_version_change, required_bump};
+use crate::types::CrateName;
 
 /// Result of scanning git diffs for version changes.
 pub struct VersionChanges {
-    pub breaking_seeds: HashSet<String>,
-    pub additive_seeds: HashSet<String>,
-    pub local_bumps: HashMap<String, Bump>,
+    pub breaking_seeds: HashSet<CrateName>,
+    pub additive_seeds: HashSet<CrateName>,
+    pub local_bumps: HashMap<CrateName, Bump>,
     /// Crates whose Cargo.toml didn't exist on the base ref (newly added).
-    pub new_crates: HashSet<String>,
+    pub new_crates: HashSet<CrateName>,
 }
 
 pub fn detect_version_changes(
@@ -27,10 +28,10 @@ pub fn detect_version_changes(
     let base = merge_base(source, target)?;
     let changed_files = get_changed_cargo_tomls(&base, target)?;
 
-    let mut breaking_seeds: HashSet<String> = HashSet::new();
-    let mut additive_seeds: HashSet<String> = HashSet::new();
-    let mut local_bumps: HashMap<String, Bump> = HashMap::new();
-    let mut new_crates: HashSet<String> = HashSet::new();
+    let mut breaking_seeds: HashSet<CrateName> = HashSet::new();
+    let mut additive_seeds: HashSet<CrateName> = HashSet::new();
+    let mut local_bumps: HashMap<CrateName, Bump> = HashMap::new();
+    let mut new_crates: HashSet<CrateName> = HashSet::new();
 
     sink.emit(&Event::DetectedChangesHeader);
 
@@ -38,7 +39,7 @@ pub fn detect_version_changes(
         let (old_toml, new_toml) = match get_toml_file_change(&base, target, file, sink) {
             Some(TomlFileChange::Added { name }) => {
                 if let Some(name) = name {
-                    new_crates.insert(name);
+                    new_crates.insert(CrateName::from(name));
                 }
                 continue;
             }
@@ -56,16 +57,16 @@ pub fn detect_version_changes(
             if old_ver_str == new_ver_str {
                 continue;
             }
-            let (Ok(ov), Ok(nv)) = (
+            let (Ok(old_ver), Ok(new_ver)) = (
                 normalize_version(old_ver_str),
                 normalize_version(new_ver_str),
             ) else {
                 continue;
             };
-            let change = classify_version_change(&ov, &nv);
+            let change = classify_version_change(&old_ver, &new_ver);
             match change {
                 ChangeKind::Breaking => {
-                    if breaking_seeds.insert(name.clone()) {
+                    if breaking_seeds.insert(CrateName::from(name.as_str())) {
                         sink.emit(&Event::DepVersionChanged {
                             name,
                             old: old_ver_str,
@@ -75,7 +76,9 @@ pub fn detect_version_changes(
                     }
                 }
                 ChangeKind::Additive => {
-                    if !breaking_seeds.contains(name) && additive_seeds.insert(name.clone()) {
+                    if !breaking_seeds.contains(name.as_str())
+                        && additive_seeds.insert(CrateName::from(name.as_str()))
+                    {
                         sink.emit(&Event::DepVersionChanged {
                             name,
                             old: old_ver_str,
@@ -91,13 +94,13 @@ pub fn detect_version_changes(
         let old_pkg = extract_package_version(&old_toml, &base, file);
         let new_pkg = extract_package_version(&new_toml, target, file);
 
-        if let (Ok((name, ov)), Ok((_, nv))) = (old_pkg, new_pkg)
-            && !local_bumps.contains_key(&name)
+        if let (Ok((name, old_ver)), Ok((_, new_ver))) = (old_pkg, new_pkg)
+            && !local_bumps.contains_key(name.as_str())
         {
             record_local_bump(
                 name,
-                &ov,
-                &nv,
+                &old_ver,
+                &new_ver,
                 BumpSource::Package,
                 &mut breaking_seeds,
                 &mut additive_seeds,
@@ -136,17 +139,17 @@ pub fn detect_version_changes(
                 };
                 let inherits = pkg
                     .get("version")
-                    .and_then(|v| v.get("workspace"))
-                    .and_then(|v| v.as_bool())
+                    .and_then(|ver| ver.get("workspace"))
+                    .and_then(|ws| ws.as_bool())
                     == Some(true);
                 if !inherits {
                     continue;
                 }
-                let Some(name) = pkg.get("name").and_then(|n| n.as_str()) else {
+                let Some(name) = pkg.get("name").and_then(|val| val.as_str()) else {
                     continue;
                 };
                 let name = name.to_string();
-                if !local_bumps.contains_key(&name) {
+                if !local_bumps.contains_key(name.as_str()) {
                     record_local_bump(
                         name,
                         &old_ws_ver,
@@ -191,9 +194,9 @@ fn get_toml_file_change(
     let new_toml = read_toml_at_ref(target, filename);
 
     let (old_toml, new_toml) = match (old_toml, new_toml) {
-        (Ok(o), Ok(n)) => (o, n),
-        (Err(_), Ok(n)) => {
-            let name = if let Ok((name, _)) = extract_package_version(&n, target, filename) {
+        (Ok(old), Ok(new)) => (old, new),
+        (Err(_), Ok(new)) => {
+            let name = if let Ok((name, _)) = extract_package_version(&new, target, filename) {
                 sink.emit(&Event::NewCrate { name: &name });
                 Some(name)
             } else {
@@ -201,8 +204,8 @@ fn get_toml_file_change(
             };
             return Some(TomlFileChange::Added { name });
         }
-        (Ok(o), Err(_)) => {
-            if let Ok((name, _)) = extract_package_version(&o, base, filename) {
+        (Ok(old), Err(_)) => {
+            if let Ok((name, _)) = extract_package_version(&old, base, filename) {
                 sink.emit(&Event::RemovedCrate { name: &name });
             }
             return Some(TomlFileChange::Removed);
@@ -240,8 +243,8 @@ fn get_changed_cargo_tomls(base: &str, target: &str) -> Result<Vec<String>> {
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|l| l.ends_with("Cargo.toml"))
-        .map(|l| l.to_string())
+        .filter(|line| line.ends_with("Cargo.toml"))
+        .map(|line| line.to_string())
         .collect())
 }
 
@@ -250,21 +253,21 @@ fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
 
     if let Some(ws_deps) = doc
         .get("workspace")
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|d| d.as_table())
+        .and_then(|ws| ws.get("dependencies"))
+        .and_then(|deps| deps.as_table())
     {
         for (name, value) in ws_deps {
-            if let Some(ver) = dep_version_string(value) {
-                versions.insert(name.clone(), ver);
+            if let Some(version) = dep_version_string(value) {
+                versions.insert(name.clone(), version);
             }
         }
     }
 
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(deps) = doc.get(section).and_then(|d| d.as_table()) {
+        if let Some(deps) = doc.get(section).and_then(|val| val.as_table()) {
             for (name, value) in deps {
-                if let Some(ver) = dep_version_string(value) {
-                    versions.entry(name.clone()).or_insert(ver);
+                if let Some(version) = dep_version_string(value) {
+                    versions.entry(name.clone()).or_insert(version);
                 }
             }
         }
@@ -275,11 +278,11 @@ fn extract_dep_versions(doc: &toml::Value) -> HashMap<String, String> {
 
 fn dep_version_string(value: &toml::Value) -> Option<String> {
     match value {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Table(t) => t
+        toml::Value::String(version) => Some(version.clone()),
+        toml::Value::Table(table) => table
             .get("version")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+            .and_then(|val| val.as_str())
+            .map(|ver| ver.to_string()),
         _ => None,
     }
 }
@@ -330,15 +333,15 @@ fn extract_package_version(
 
     let name = pkg
         .get("name")
-        .and_then(|n| n.as_str())
+        .and_then(|val| val.as_str())
         .context("No package.name")?
         .to_string();
 
     let version_value = pkg.get("version").context("No package.version")?;
 
-    let version = if let Some(v) = version_value.as_str() {
-        Version::parse(v).with_context(|| format!("Invalid semver: {}", v))?
-    } else if version_value.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
+    let version = if let Some(ver_str) = version_value.as_str() {
+        Version::parse(ver_str).with_context(|| format!("Invalid semver: {}", ver_str))?
+    } else if version_value.get("workspace").and_then(|ws| ws.as_bool()) == Some(true) {
         find_workspace_version(git_ref, file_path).with_context(|| {
             format!(
                 "{} uses version.workspace = true but could not resolve workspace version",
@@ -371,8 +374,8 @@ fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Versio
         {
             if let Some(version_str) = ws
                 .get("package")
-                .and_then(|p| p.get("version"))
-                .and_then(|v| v.as_str())
+                .and_then(|pkg| pkg.get("version"))
+                .and_then(|val| val.as_str())
             {
                 return Version::parse(version_str)
                     .with_context(|| format!("Invalid workspace version: {}", version_str));
@@ -395,37 +398,38 @@ fn find_workspace_version(git_ref: &str, crate_toml_path: &str) -> Result<Versio
 #[allow(clippy::too_many_arguments)]
 fn record_local_bump(
     name: String,
-    ov: &Version,
-    nv: &Version,
+    old_ver: &Version,
+    new_ver: &Version,
     source: BumpSource,
-    breaking_seeds: &mut HashSet<String>,
-    additive_seeds: &mut HashSet<String>,
-    local_bumps: &mut HashMap<String, Bump>,
+    breaking_seeds: &mut HashSet<CrateName>,
+    additive_seeds: &mut HashSet<CrateName>,
+    local_bumps: &mut HashMap<CrateName, Bump>,
     sink: &dyn EventSink,
 ) {
-    let change = classify_version_change(ov, nv);
+    let change = classify_version_change(old_ver, new_ver);
     if matches!(change, ChangeKind::None) {
         return;
     }
-    let bump = required_bump(ov, change);
+    let bump = required_bump(old_ver, change);
     sink.emit(&Event::LocalPackageBump {
         name: &name,
-        old: ov,
-        new: nv,
+        old: old_ver,
+        new: new_ver,
         kind: change,
         source,
     });
+    let crate_name = CrateName::from(name);
     match change {
         ChangeKind::Breaking => {
-            breaking_seeds.insert(name.clone());
-            local_bumps.insert(name, bump);
+            breaking_seeds.insert(crate_name.clone());
+            local_bumps.insert(crate_name, bump);
         }
         ChangeKind::Additive => {
-            additive_seeds.insert(name.clone());
-            local_bumps.insert(name, bump);
+            additive_seeds.insert(crate_name.clone());
+            local_bumps.insert(crate_name, bump);
         }
         ChangeKind::Patch => {
-            local_bumps.insert(name, Bump::Patch);
+            local_bumps.insert(crate_name, Bump::Patch);
         }
         ChangeKind::None => {}
     }
@@ -436,16 +440,16 @@ fn extract_workspace_package_version(doc: &toml::Value) -> Option<Version> {
         .get("package")?
         .get("version")?
         .as_str()
-        .and_then(|s| Version::parse(s).ok())
+        .and_then(|ver_str| Version::parse(ver_str).ok())
 }
 
 fn extract_workspace_members(doc: &toml::Value) -> Vec<String> {
     doc.get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
+        .and_then(|ws| ws.get("members"))
+        .and_then(|members| members.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|val| val.as_str().map(|path| path.to_string()))
                 .collect()
         })
         .unwrap_or_default()

@@ -39,6 +39,7 @@ mod seeds;
 mod semver;
 
 mod run;
+mod types;
 
 use anyhow::Result;
 use clap::Parser;
@@ -55,5 +56,5 @@ fn main() -> Result<()> {
     };
     let sink = StreamSink::new(choice);
 
-    run::run(cli, &sink)
+    run::run(&cli, &sink)
 }

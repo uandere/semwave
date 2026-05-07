@@ -276,13 +276,13 @@ impl EventSink for StreamSink {
                     "\n{} These crates have insufficient version bumps:",
                     styled("ERROR:", RED_BOLD),
                 );
-                for (name, required, local) in *items {
+                for item in *items {
                     let _ = writeln!(
                         w,
                         "  {} has {} bump but requires {}",
-                        styled(name, CYAN),
-                        local,
-                        required,
+                        styled(item.name, CYAN),
+                        item.local,
+                        item.required,
                     );
                 }
             }
@@ -293,8 +293,13 @@ impl EventSink for StreamSink {
                     "\n{} These crates need a version bump but have none:",
                     styled("ERROR:", RED_BOLD),
                 );
-                for (name, required) in *items {
-                    let _ = writeln!(w, "  {} requires {}", styled(name, CYAN), required,);
+                for item in *items {
+                    let _ = writeln!(
+                        w,
+                        "  {} requires {}",
+                        styled(item.name, CYAN),
+                        item.required,
+                    );
                 }
             }
         }

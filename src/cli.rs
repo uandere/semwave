@@ -1,5 +1,7 @@
 use clap::Parser;
 
+use crate::types::Toolchain;
+
 #[derive(Parser)]
 #[command(about = "Determine semver bump requirements for workspace crates.")]
 pub struct Cli {
@@ -34,7 +36,7 @@ pub struct Cli {
 
     /// Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15")
     #[arg(long, default_value = "nightly")]
-    pub toolchain: String,
+    pub toolchain: Toolchain,
 
     /// Include binary-only crates in the analysis (skipped by default)
     #[arg(long)]
