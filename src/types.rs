@@ -43,6 +43,41 @@ impl Borrow<str> for CrateName {
     }
 }
 
+/// Crate name normalized to Rust identifier form (hyphens replaced with
+/// underscores), matching the convention used by rustdoc / rustc.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RustdocCrateName(String);
+
+impl fmt::Display for RustdocCrateName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&CrateName> for RustdocCrateName {
+    fn from(name: &CrateName) -> Self {
+        Self(name.as_str().replace('-', "_"))
+    }
+}
+
+impl From<String> for RustdocCrateName {
+    fn from(s: String) -> Self {
+        Self(s.replace('-', "_"))
+    }
+}
+
+impl From<&str> for RustdocCrateName {
+    fn from(s: &str) -> Self {
+        Self(s.replace('-', "_"))
+    }
+}
+
+impl Borrow<str> for RustdocCrateName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ManifestPath(String);
 

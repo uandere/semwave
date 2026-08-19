@@ -5,7 +5,7 @@ use crate::{
     leak::find_leaked_deps,
     report::{Event, EventSink, LeakDetail},
     semver::{Bump, ChangeKind, required_bump},
-    types::{CrateName, ManifestPath},
+    types::{CrateName, ManifestPath, RustdocCrateName},
 };
 use anyhow::{Context, Result};
 use cargo_metadata::{DependencyKind, Node, NodeDep, PackageId};
@@ -157,16 +157,19 @@ pub fn evaluate_crate_bump(
     let krate: rustdoc_types::Crate = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse rustdoc JSON for {}", node_name))?;
 
-    let dep_norm_set: HashSet<String> = affected_deps
+    let dep_norm_set: HashSet<RustdocCrateName> = affected_deps
         .iter()
-        .map(|(name, _)| name.as_str().replace('-', "_"))
+        .map(|(name, _)| RustdocCrateName::from(*name))
         .collect();
 
-    let dep_crate_id_to_name: HashMap<u32, String> = krate
+    let dep_crate_id_to_name: HashMap<u32, RustdocCrateName> = krate
         .external_crates
         .iter()
-        .filter(|(_, ec)| dep_norm_set.contains(&ec.name.replace('-', "_")))
-        .map(|(id, ec)| (*id, ec.name.clone()))
+        .filter(|(_, ec)| {
+            let normalized = RustdocCrateName::from(ec.name.as_str());
+            dep_norm_set.contains(&normalized)
+        })
+        .map(|(id, ec)| (*id, RustdocCrateName::from(ec.name.clone())))
         .collect();
 
     let leaked = find_leaked_deps(&krate, &dep_crate_id_to_name);
@@ -175,18 +178,15 @@ pub fn evaluate_crate_bump(
     let mut influences = Vec::new();
 
     for (dep_name, dep_change) in affected_deps {
-        let dep_norm = dep_name.as_str().replace('-', "_");
-        let is_leaked = leaked.keys().any(|k| k.replace('-', "_") == dep_norm);
+        let rustdoc_name = RustdocCrateName::from(dep_name);
 
-        if is_leaked {
+        if let Some(leak_items) = leaked.get(&rustdoc_name) {
             let edge_bump = node_version
                 .map(|version| required_bump(version, dep_change))
                 .unwrap_or(Bump::Minor);
             let details: Vec<LeakDetail> = if cli.verbose {
-                leaked
+                leak_items
                     .iter()
-                    .filter(|(leaked_name, _)| leaked_name.replace('-', "_") == dep_norm)
-                    .flat_map(|(_, items)| items.iter())
                     .map(|detail| LeakDetail {
                         item_kind: detail.item_kind.to_string(),
                         item_name: detail.item_name.clone(),

@@ -5,6 +5,8 @@ use rustdoc_types::{
     Type, VariantKind, WherePredicate,
 };
 
+use crate::types::RustdocCrateName;
+
 type PathsMap = HashMap<rustdoc_types::Id, rustdoc_types::ItemSummary>;
 type CrateIdSet = HashSet<(u32, String)>;
 
@@ -317,8 +319,8 @@ impl CollectCrateIds for rustdoc_types::Item {
 
 pub fn find_leaked_deps(
     krate: &rustdoc_types::Crate,
-    dep_crate_ids: &HashMap<u32, String>,
-) -> HashMap<String, Vec<LeakDetail>> {
+    dep_crate_ids: &HashMap<u32, RustdocCrateName>,
+) -> HashMap<RustdocCrateName, Vec<LeakDetail>> {
     let mut child_parents: HashMap<&rustdoc_types::Id, String> = HashMap::new();
     for (id, item) in &krate.index {
         let parent_path = krate
@@ -360,7 +362,7 @@ pub fn find_leaked_deps(
         }
     }
 
-    let mut result: HashMap<String, Vec<LeakDetail>> = HashMap::new();
+    let mut result: HashMap<RustdocCrateName, Vec<LeakDetail>> = HashMap::new();
 
     for (id, item) in &krate.index {
         let mut refs = CrateIdSet::new();
@@ -397,7 +399,7 @@ pub fn find_leaked_deps(
             .unwrap_or_else(|| "<unnamed>".to_string());
         let item_kind = item_kind_label(item);
 
-        let mut per_dep: HashMap<&str, BTreeSet<String>> = HashMap::new();
+        let mut per_dep: HashMap<&RustdocCrateName, BTreeSet<String>> = HashMap::new();
         for (crate_id, type_path) in &refs {
             if let Some(dep_name) = dep_crate_ids.get(crate_id) {
                 per_dep
@@ -409,7 +411,7 @@ pub fn find_leaked_deps(
 
         for (dep_name, leaked_types) in per_dep {
             result
-                .entry(dep_name.to_owned())
+                .entry(dep_name.clone())
                 .or_default()
                 .push(LeakDetail {
                     item_name: item_name.clone(),
@@ -761,7 +763,7 @@ mod tests {
         index.insert(fn_id, fn_item);
 
         let krate = make_crate(index, HashMap::new(), HashMap::new());
-        let dep_ids: HashMap<u32, String> = HashMap::new();
+        let dep_ids: HashMap<u32, RustdocCrateName> = HashMap::new();
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(leaked.is_empty());
@@ -820,7 +822,7 @@ mod tests {
 
         let krate = make_crate(index, paths_map, ext_crates);
         let mut dep_ids = HashMap::new();
-        dep_ids.insert(5u32, "ext_dep".to_string());
+        dep_ids.insert(5u32, RustdocCrateName::from("ext_dep"));
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(leaked.contains_key("ext_dep"));
@@ -883,7 +885,7 @@ mod tests {
 
         let krate = make_crate(index, paths_map, ext_crates);
         let mut dep_ids = HashMap::new();
-        dep_ids.insert(5u32, "ext_dep".to_string());
+        dep_ids.insert(5u32, RustdocCrateName::from("ext_dep"));
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(
@@ -951,7 +953,7 @@ mod tests {
 
         let krate = make_crate(index, paths_map, ext_crates);
         let mut dep_ids = HashMap::new();
-        dep_ids.insert(3u32, "dep".to_string());
+        dep_ids.insert(3u32, RustdocCrateName::from("dep"));
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(leaked.contains_key("dep"));
@@ -1005,7 +1007,7 @@ mod tests {
 
         let krate = make_crate(index, paths_map, ext_crates);
         let mut dep_ids = HashMap::new();
-        dep_ids.insert(2u32, "foreign".to_string());
+        dep_ids.insert(2u32, RustdocCrateName::from("foreign"));
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(leaked.contains_key("foreign"));
@@ -1086,8 +1088,8 @@ mod tests {
 
         let krate = make_crate(index, paths_map, ext_crates);
         let mut dep_ids = HashMap::new();
-        dep_ids.insert(2u32, "dep_a".to_string());
-        dep_ids.insert(3u32, "dep_b".to_string());
+        dep_ids.insert(2u32, RustdocCrateName::from("dep_a"));
+        dep_ids.insert(3u32, RustdocCrateName::from("dep_b"));
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(
@@ -1145,7 +1147,7 @@ mod tests {
         index.insert(fn_id, fn_item);
 
         let krate = make_crate(index, paths_map, HashMap::new());
-        let dep_ids: HashMap<u32, String> = HashMap::new();
+        let dep_ids: HashMap<u32, RustdocCrateName> = HashMap::new();
 
         let leaked = find_leaked_deps(&krate, &dep_ids);
         assert!(

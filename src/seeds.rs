@@ -75,17 +75,16 @@ pub fn detect_version_changes(
                         });
                     }
                 }
-                ChangeKind::Additive => {
+                ChangeKind::Additive
                     if !breaking_seeds.contains(name.as_str())
-                        && additive_seeds.insert(CrateName::from(name.as_str()))
-                    {
-                        sink.emit(&Event::DepVersionChanged {
-                            name,
-                            old: old_ver_str,
-                            new: new_ver_str,
-                            kind: ChangeKind::Additive,
-                        });
-                    }
+                        && additive_seeds.insert(CrateName::from(name.as_str())) =>
+                {
+                    sink.emit(&Event::DepVersionChanged {
+                        name,
+                        old: old_ver_str,
+                        new: new_ver_str,
+                        kind: ChangeKind::Additive,
+                    });
                 }
                 _ => {}
             }
