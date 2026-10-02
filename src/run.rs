@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use cargo_metadata::{CargoOpt, MetadataCommand, Node, PackageId};
+use cargo_metadata::{CargoOpt, MetadataCommand, Node, PackageId, Target, TargetKind};
 use std::collections::{HashMap, HashSet};
 
 use crate::cli::Cli;
@@ -9,6 +9,22 @@ use crate::report::{Event, EventSink};
 use crate::seeds::detect_version_changes;
 use crate::semver::{Bump, ChangeKind, required_bump};
 use crate::types::{CrateName, ManifestPath, MissingBumpItem, TreeEdge, UnderBumpedItem};
+
+/// Cargo reports `[lib] crate-type = [...]` entries as the target kinds instead
+/// of `lib`, so every library crate type has to be matched explicitly.
+fn is_library_target(target: &Target) -> bool {
+    target.kind.iter().any(|kind| {
+        matches!(
+            kind,
+            TargetKind::Lib
+                | TargetKind::RLib
+                | TargetKind::DyLib
+                | TargetKind::CDyLib
+                | TargetKind::StaticLib
+                | TargetKind::ProcMacro
+        )
+    })
+}
 
 pub fn run(cli: &Cli, sink: &dyn EventSink) -> Result<()> {
     let is_direct = cli.direct.is_some();
@@ -95,11 +111,7 @@ pub fn run(cli: &Cli, sink: &dyn EventSink) -> Result<()> {
             .packages
             .iter()
             .filter(|pkg| workspace_members.contains(&pkg.id))
-            .filter(|pkg| {
-                pkg.targets
-                    .iter()
-                    .any(|target| target.is_lib() || target.is_proc_macro())
-            })
+            .filter(|pkg| pkg.targets.iter().any(is_library_target))
             .map(|pkg| CrateName::from(pkg.name.to_string()))
             .collect(),
         pkg_versions: metadata
@@ -346,4 +358,50 @@ pub fn run(cli: &Cli, sink: &dyn EventSink) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(kinds: &[&str]) -> Target {
+        serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "kind": kinds,
+            "crate_types": kinds,
+            "src_path": "src/lib.rs",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_lib_is_library() {
+        assert!(is_library_target(&target(&["lib"])));
+    }
+
+    #[test]
+    fn cdylib_only_is_library() {
+        assert!(is_library_target(&target(&["cdylib"])));
+    }
+
+    #[test]
+    fn cdylib_with_rlib_is_library() {
+        assert!(is_library_target(&target(&["cdylib", "rlib"])));
+    }
+
+    #[test]
+    fn other_library_crate_types_are_libraries() {
+        assert!(is_library_target(&target(&["dylib"])));
+        assert!(is_library_target(&target(&["staticlib"])));
+        assert!(is_library_target(&target(&["proc-macro"])));
+    }
+
+    #[test]
+    fn non_library_targets_are_not_libraries() {
+        assert!(!is_library_target(&target(&["bin"])));
+        assert!(!is_library_target(&target(&["example"])));
+        assert!(!is_library_target(&target(&["test"])));
+        assert!(!is_library_target(&target(&["bench"])));
+        assert!(!is_library_target(&target(&["custom-build"])));
+    }
 }
