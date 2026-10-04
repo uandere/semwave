@@ -112,6 +112,7 @@ Options:
       --toolchain <TOOLCHAIN>  Rust toolchain to use for rustdoc JSON generation (e.g. "nightly-2025-01-15") [default: nightly]
       --include-binaries       Include binary-only crates in the analysis (skipped by default)
   -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 > **Note:** By default, `semwave` skips re-analyzing crates that are already at the maximum bump level (breaking), which can dramatically speed up runs in large workspaces with many inter-dependent seeds. Passing `--tree` disables this optimization so the full influence tree can be built, which may result in noticeably longer analysis times.

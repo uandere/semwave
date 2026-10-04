@@ -3,7 +3,7 @@ use clap::Parser;
 use crate::types::Toolchain;
 
 #[derive(Parser)]
-#[command(about = "Determine semver bump requirements for workspace crates.")]
+#[command(version, about ="Determine semver bump requirements for workspace crates.")]
 pub struct Cli {
     /// Source git ref to compare from (the base)
     #[arg(long, default_value = "main")]
